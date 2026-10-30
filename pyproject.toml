@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-engram-ssd"
+version = "0.1.0"
+description = "Out-of-tree DeepSeek V4.1 Engram SSD hooks for SGLang"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[project.entry-points."sglang.srt.plugins"]
+engram_ssd = "sglang_engram_ssd:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]

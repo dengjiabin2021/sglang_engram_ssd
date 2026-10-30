@@ -6,3 +6,4 @@ dist/
 .venv/
 *.log
 .DS_Store
+src/sglang_engram_ssd/query/_C*.so

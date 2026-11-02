@@ -40,7 +40,7 @@ Python 接口为 `read_rows(*, layer_id, row_ids, weight_out, scale_out) -> None
 
 C++ 使用输出 Tensor 的 `data_ptr()` 直接填充：未命中时 `pread` 写入 pinned 输出，命中时从 LRU 复制到 pinned 输出。不经过 Python `bytearray`、`frombuffer` 或额外的普通 CPU 输出张量；保留缓存副本时仍需将读取结果复制进 LRU。
 
-创建工作区时持有 GIL，批量读取时仍按原约定释放 GIL。覆盖工作区前，调用方必须等待此前 H2D 和 GPU 使用完成；本阶段不增加传输流水或双缓冲。
+创建工作区时持有 GIL，批量读取时仍按原约定释放 GIL。重新填充同一 pinned 工作区前，调用方必须等待此前从它发起的 H2D 完成；GPU 工作区的复用另由 runtime 等待对应 gather 完成。runtime 按流水开关分配一组或两组 pinned 输出，reader 接口本身不管理 CUDA stream 或双缓冲。
 
 ## 跨层行缓存
 
@@ -91,7 +91,7 @@ ring 使用 `flags=0`，不启用 SQPOLL，按[实际提交数](https://github.c
 
 已实现 C++ 串行 `pread`、有界线程池及可选 `io_uring`，共用 LRU 和 pinned 工作区。各路径均补齐短读、重试 `EINTR`，在 EOF 或 I/O 错误时抛出异常。只写前 Q 行，不排序、不去重。
 
-服务提供 Python 串行、C++ 线程池和 C++ io_uring 三个后端，均接入 runtime 的 `all_queries`。`SGLANG_DSV41_ENGRAM_SSD_QUERY_BACKEND` 默认为 `python`；Python 路径不加载 `query._C`，原生模块只在选择 C++ 后端并创建 reader 时加载。
+服务提供 Python 串行、C++ 线程池和 C++ io_uring 三个后端，均支持 `all_queries` 和 `owner_allreduce`；owner 模式筛选后复用同一全查询实现。`SGLANG_DSV41_ENGRAM_SSD_QUERY_BACKEND` 默认为 `python`；Python 路径不加载 `query._C`，原生模块只在选择 C++ 后端并创建 reader 时加载。
 
 | `QUERY_BACKEND` 值 | 原生 `io_backend` | 使用的读取参数 |
 | --- | --- | --- |
@@ -105,11 +105,62 @@ ring 使用 `flags=0`，不启用 SQPOLL，按[实际提交数](https://github.c
 
 原生后端的 runtime 在表初始化后创建一个跨层 reader，借用所有层的 fd，并复用 C++ 分配的 pinned 工作区。每块直接传入连续 CPU `int64` 行号片段，原生路径不转 Python 列表、不填充 Python LRU；Python 后端继续使用原缓存、串行逐行读取与工作区填充。
 
-三个后端均保留同步 D2H、按 K 分块、H2D、gather 及块末 CUDA event 等待。关闭时先释放 reader，再关闭 runtime 持有的文件 fd。未构建扩展、未启用 liburing 或后端初始化失败时直接报错，不静默回退。
+三个后端均保留同步 D2H 和按 K 分块，H2D 与 gather 的调度由 runtime 的块间流水开关决定。按层预取开启时，同一个 lookup 在后台线程执行，保留这条数据路径。runtime 关闭时先结束预取线程，再释放 reader，最后关闭文件 fd。未构建扩展、未启用 liburing 或后端初始化失败时直接报错，不静默回退。
 
 绑定在持有 GIL 时转换表字段和 Tensor 参数，仅在 C++ `read_rows()` 执行期间释放 GIL；返回或抛出异常后自动恢复 GIL。Python 实例锁串行化读取和关闭，避免 GIL 释放后另一线程清空表信息，不协调不同 rank。
 
 `close()` 可重复调用，关闭后再次读取会报错，借用的 fd 仍由调用方关闭。
+
+## Runtime owner 查询与归约
+
+`SGLANG_DSV41_ENGRAM_SSD_LOOKUP_MODE` 默认 `all_queries`，也可设为 `owner_allreduce`。每层 N 行、P 个 TP rank 时，rank r 负责 `[N*r//P, N*(r+1)//P)`；N 不必整除 P，允许空区间。只划分读取责任，每节点仍使用同版本的完整 checkpoint，不产生分片文件。
+
+`_lookup_owner_allreduce()` 在 GPU 展平 `[T,C]`，筛出本 rank 的原查询位置 `positions[M]`，用 `index_select` 得到仍为全局行号的 `owner_ids[M]`。原 `_lookup_all_queries()` 读取紧凑 BF16 `[M,D]` 后，通过 `index_copy_` 回填完整零张量 `[T,C,D]`；重复查询不去重，位置保持原顺序。清零与回填完成后才返回。reader、LRU、分块、H2D 和 A/B gather 全部复用，不新增读取后端或 C++ owner 逻辑。
+
+`EngramEmbedding.forward` 在模型线程取得 lookup/Future 结果后，统一调用 `reduce_output()`，使用 `tensor_model_parallel_all_reduce()` 的返回值。每个实际 Engram 调用点归约一次完整输出，不按块通信；无本地命中的 rank 仍带完整零张量参加。TP=1 直接走全查询，全局空输出跳过归约。后台查询始终不通信，避免与 Attention/MoE 集体调用交错；`all_queries` 不增加归约。
+
+三种读取后端、`PIPELINE` 和按层预取均可组合。owner 模式增加紧凑 `[M,D]` BF16、位置和行号临时张量，仍有完整输出及 all-reduce 的通信/缓冲开销。当前仅静态核对，实际 TP 与跨节点运行尚未验证。
+
+## Runtime 块间流水
+
+`SGLANG_ENABLE_DSV41_ENGRAM_SSD_PIPELINE` 默认 `0`，适用于全部三个服务后端。关闭时使用一套 CPU/GPU 工作区，在初始化时确定的同一条流上逐块传输和 gather，并在块末等待；开启时使用 A/B 两套工作区，独立的 `copy_stream` 执行 H2D，固定的 `gather_stream` 执行 gather。
+
+`EngramSsdBuffer` 是保存张量、流和事件的数据类，不包含构造和调度方法。runtime 初始化时为 A/B 分别新建独立的固定 `gather_stream`，两者都与模型主流分开，后续 lookup 不重新绑定。开启流水时 A/B 共用一条独立 `copy_stream`，关闭时只有一套工作区，`copy_stream=gather_stream`。`h2d_done`、`gather_done` 保护各槽复用；结束时分别记录并等待各槽的 `lookup_done`，收齐两条 gather 流。
+
+执行 lookup 的线程顺序读取各块，提交 GPU 工作后即可填充另一套 Host 工作区。`PIPELINE` 本身不创建后台线程；reader 仍只负责把当前块读满，runtime 按下列依赖保护缓冲区：
+
+| 操作 | 等待条件 |
+| --- | --- |
+| CPU 重新填充 Host A/B | 该 Host 槽上一次 H2D 已完成。 |
+| H2D 覆盖 GPU A/B | 该 GPU 槽上一次 gather 已完成。 |
+| gather 读取 GPU A/B | 本块 H2D 已完成。 |
+
+lookup 结束前排空本次 GPU 工作再释放 runtime 锁，保持同步返回。最终 BF16 输出和只读 `device_ids` 共用一份；仅 CPU/GPU 中转区从一套变成两套，行缓存预算不变。该开关只负责 lookup 内的块间重叠，跨层预取由独立开关控制；重叠收益需在目标设备确认。
+
+在服务启动前设置 `export SGLANG_ENABLE_DSV41_ENGRAM_SSD_PIPELINE=1` 即可开启，改为 `0` 恢复逐块等待；修改后需重启服务。
+
+## Runtime 按层预取
+
+`SGLANG_ENABLE_DSV41_ENGRAM_SSD_PREFETCH` 默认 `0`。开启后，每个 runtime 使用一个持久后台线程直接执行原 `runtime.lookup()`，Future 保存整层形状的 BF16 GPU 输出；owner 模式下是尚未归约的局部结果。`SGLANG_DSV41_ENGRAM_SSD_PREFETCH_LAYERS` 使用逗号分隔的模型层号，如 `14`、`1,14`；未设置或为空表示全部 Engram 层。预取关闭时，显式设置层号只 warning 并忽略。
+
+| 阶段 | 执行动作 |
+| --- | --- |
+| 模型进入 | AROUND Hook 建立本次 forward 上下文。 |
+| hash 就绪 | AFTER Hook 保留原 hash/history 更新，立即按层号顺序统一提交所有选中层的任务；任务持有该层索引视图和就绪事件。 |
+| 后台查询 | 以 A 的流等待 hash 就绪并准备索引，各块使用 A/B 各自的 gather 流；复用原 lookup、行缓存、reader 和 A/B 工作区。 |
+| Embedding 消费 | 本层有 Future 则取结果，未完成则等待；没有任务则同步 lookup。随后在模型线程统一调用 `reduce_output()`，owner 多 rank 非空输出在此归约。 |
+| forward 退出 | 正常或异常路径都收齐后台任务；关闭 runtime 时先停止线程，再释放 reader/fd。 |
+
+上下文只保存 runtime、模型层号到 `hash_ids[T,L,C]` 中第二个维度 L 的位置映射、层号到 Future 的字典。任务统一提交后，由一个 worker 复用现有 A/B 工作区排队执行，不等待前层输出被消费，也不表示多层 lookup 并发。未预取层的同步 lookup 使用同一个 `runtime.lock`，后台另一层正在查询时会等锁。三个读取后端、行缓存和 `PIPELINE` 配置继续生效，不回到 SGLang 原表；不增加 CPU raw 块池或第二份缓存。
+
+Future 完成时，本 rank 的查询与回填已在 GPU 就绪；owner 模式的 TP 归约仍留在模型线程，后台不做通信。前台用 `record_stream` 保护消费期间的存储寿命，并从字典移除已消费的 Future。多个已完成但尚未消费的层输出可以累积，每层 BF16 `[T,C,D]` 额外占用 `2*T*C*D` 字节。forward 结束时收齐其余任务并清空字典。
+
+两个额外 Hook 仅在预取开启时登记并检查，关闭时保持按层 lookup。允许与 decoder SWA bounded replay 同开：当前第 1、14 层位于裁剪边界前时，形状不受影响；边界后各层的预取结果尚未接入 tail 行映射。原并行、投机和 graph 限制不变。配置示例：
+
+```bash
+export SGLANG_ENABLE_DSV41_ENGRAM_SSD_PREFETCH=1
+export SGLANG_DSV41_ENGRAM_SSD_PREFETCH_LAYERS=14
+```
 
 ## 原生模块构建
 

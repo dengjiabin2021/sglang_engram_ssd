@@ -21,6 +21,9 @@ class EngramSsdConfig:
     enabled: bool
     lookup_mode: str
     query_backend: str
+    pipeline_enabled: bool
+    prefetch_enabled: bool
+    prefetch_layer_ids: tuple[int, ...]
     num_threads: int | None
     thread_pool_queue_depth: int | None
     io_uring_queue_depth: int | None
@@ -32,6 +35,12 @@ def should_register_hooks() -> bool:
     # 只判断是否明确关闭，不做会抛异常的完整配置校验。
     # 非法开关值也先登记 Hook，随后由模型加载入口的 get_config 严格拒绝。
     raw = os.getenv("SGLANG_ENABLE_DSV41_ENGRAM_SSD", "0").lower()
+    return raw not in _DISABLED_VALUES
+
+
+def should_register_prefetch_hooks() -> bool:
+    # 这里只决定是否登记；非法值交给模型加载入口严格校验。
+    raw = os.getenv("SGLANG_ENABLE_DSV41_ENGRAM_SSD_PREFETCH", "0").lower()
     return raw not in _DISABLED_VALUES
 
 
@@ -65,12 +74,12 @@ def get_config() -> EngramSsdConfig:
         # 正常关闭时不会登记 Hook；此处只接受已启用 SSD 的调用。
         raise RuntimeError("get_config() requires Engram SSD to be enabled")
 
-    # 当前只开放每个 rank 处理全部查询的模式；未实现的模式在模型加载前报错。
+    # all_queries 每 rank 查询全部行；owner_allreduce 只查询本 rank 的行区间后合并输出。
     lookup_mode = os.getenv("SGLANG_DSV41_ENGRAM_SSD_LOOKUP_MODE", "all_queries").lower()
-    if lookup_mode != "all_queries":
+    if lookup_mode not in {"all_queries", "owner_allreduce"}:
         raise ValueError(
             f"Unsupported SGLANG_DSV41_ENGRAM_SSD_LOOKUP_MODE={lookup_mode!r}; "
-            "currently only 'all_queries' is supported"
+            "expected all_queries or owner_allreduce"
         )
 
     # 查询模式决定哪些行由当前 rank 处理，读取后端决定这些行如何从文件取出。
@@ -81,6 +90,28 @@ def get_config() -> EngramSsdConfig:
             f"Unsupported SGLANG_DSV41_ENGRAM_SSD_QUERY_BACKEND={query_backend!r}; "
             "expected python, cpp_thread_pool or cpp_io_uring"
         )
+
+    # 三个后端共用的单次 lookup 块间流水，默认关闭；不改变跨层查询时机。
+    pipeline_raw = os.getenv("SGLANG_ENABLE_DSV41_ENGRAM_SSD_PIPELINE", "0").lower()
+    if pipeline_raw not in _ENABLED_VALUES and pipeline_raw not in _DISABLED_VALUES:
+        raise ValueError("SGLANG_ENABLE_DSV41_ENGRAM_SSD_PIPELINE must be a boolean")
+    pipeline_enabled = pipeline_raw in _ENABLED_VALUES
+
+    # 预取只改变查表时机；未选中的层仍使用相同的 SSD lookup 和读取后端。
+    prefetch_raw = os.getenv("SGLANG_ENABLE_DSV41_ENGRAM_SSD_PREFETCH", "0").lower()
+    if prefetch_raw not in _ENABLED_VALUES and prefetch_raw not in _DISABLED_VALUES:
+        raise ValueError("SGLANG_ENABLE_DSV41_ENGRAM_SSD_PREFETCH must be a boolean")
+    prefetch_enabled = prefetch_raw in _ENABLED_VALUES
+    prefetch_layer_ids = ()
+    layer_names = os.getenv("SGLANG_DSV41_ENGRAM_SSD_PREFETCH_LAYERS")
+    if prefetch_enabled and layer_names and layer_names.strip():
+        # 空配置表示全部 Engram 层；具体层号在取得模型 catalog 后检查。
+        prefetch_layer_ids = tuple(sorted({int(value.strip()) for value in layer_names.split(",")}))
+        if any(layer_id < 0 for layer_id in prefetch_layer_ids):
+            raise ValueError("SGLANG_DSV41_ENGRAM_SSD_PREFETCH_LAYERS requires non-negative layer IDs")
+    elif not prefetch_enabled and layer_names is not None:
+        logger.warning("Ignoring SGLANG_DSV41_ENGRAM_SSD_PREFETCH_LAYERS: prefetch is disabled")
+
     # 两类队列分别配置：线程池统计等待的行任务，io_uring 统计在途文件读取。
     # 不适用字段保存 None，不将它们的默认值或原始配置传给其他后端。
     num_threads = _read_backend_positive_int(
@@ -111,6 +142,9 @@ def get_config() -> EngramSsdConfig:
         enabled=enabled,
         lookup_mode=lookup_mode,
         query_backend=query_backend,
+        pipeline_enabled=pipeline_enabled,
+        prefetch_enabled=prefetch_enabled,
+        prefetch_layer_ids=prefetch_layer_ids,
         num_threads=num_threads,
         thread_pool_queue_depth=thread_pool_queue_depth,
         io_uring_queue_depth=io_uring_queue_depth,

@@ -54,7 +54,8 @@ class BatchRowReader(Protocol):
         """分配一对可复用的 CPU uint8 pinned 输出，capacity 必须为正数。
 
         返回 [capacity,D] 和 [capacity,D/32]，由调用方持有，不计入行缓存预算。
-        相同行宽的层可共用；每次覆盖前须确保此前 H2D 和 GPU 使用已经完成。
+        相同行宽的层可共用；重写 CPU 工作区前须等待此前从它发起的 H2D 完成。
+        GPU 中转槽的复用由 runtime 单独管理，覆盖前须等待此前 gather 完成。
         """
         ...
 
@@ -79,7 +80,7 @@ class BatchRowReader(Protocol):
 
         输入与两个输出的内存区间不得重叠。调用方负责串行调用同一 reader，
         并在调用期间保持输入、输出有效且不被复用。
-        输出的后续 H2D 和 GPU 使用完成之前，调用方仍不得覆盖对应工作区。
+        后续 H2D 完成之前，调用方不得覆盖对应 CPU 工作区。
         """
         ...
 

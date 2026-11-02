@@ -39,7 +39,7 @@ def load_model_with_engram_ssd(
 ) -> Any:
     # 必须先在模型加载调用链内校验；此处异常不再经过插件注册的捕获逻辑。
     config = get_config()
-    _check_hook_installation()
+    _check_hook_installation(prefetch_enabled=config.prefetch_enabled)
 
     # 本 Hook 由独立的 SSD 开关启用，不读取原 HOST_TABLE 开关或 DDR 布局。
 
@@ -71,12 +71,11 @@ def load_model_with_engram_ssd(
     ):
         raise ValueError("Engram SSD requires the default selective safetensors loading path")
     if (
-        parallel.nnodes != 1
-        or parallel.pp_size != 1
+        parallel.pp_size != 1
         or parallel.attn_dp_size != 1
         or parallel.attn_cp_size != 1
     ):
-        raise ValueError("Engram SSD currently supports single-node plain TP")
+        raise ValueError("Engram SSD currently supports plain TP without PP or attention DP/CP")
     if get_disagg().disaggregation_mode != "null":
         raise ValueError("Engram SSD currently does not support PD disaggregation")
     if get_spec().speculative_algorithm:
@@ -100,13 +99,23 @@ def load_model_with_engram_ssd(
         root=Path(model.model_path), name_mapper=name_mapper,
         layer_rows=layer_rows, dim=hf_config.engram_head_dim,
     )
+    prefetch_layer_ids = ()
+    if config.prefetch_enabled:
+        prefetch_layer_ids = config.prefetch_layer_ids or catalog.layer_ids
+        unknown_layers = set(prefetch_layer_ids) - set(catalog.layer_ids)
+        if unknown_layers:
+            raise ValueError(f"Engram SSD prefetch layers are not Engram layers: {sorted(unknown_layers)}")
     install_engram_ssd_catalog(catalog=catalog)
     logger.info(
-        "Engram SSD enabled: TP rank=%s, layers=%s, lookup_mode=%s, "
-        "query_backend=%s, num_threads=%s, thread_pool_queue_depth=%s, "
-        "io_uring_queue_depth=%s, cache_bytes=%s, chunk_rows=%s",
-        parallel.tp_rank, catalog.layer_ids, config.lookup_mode, config.query_backend,
-        config.num_threads, config.thread_pool_queue_depth, config.io_uring_queue_depth,
+        "Engram SSD enabled: TP rank=%s, tp_size=%s, cuda_device=%s, layers=%s, lookup_mode=%s, "
+        "query_backend=%s, pipeline_enabled=%s, prefetch_enabled=%s, prefetch_layer_ids=%s, "
+        "num_threads=%s, "
+        "thread_pool_queue_depth=%s, io_uring_queue_depth=%s, cache_bytes=%s, chunk_rows=%s",
+        parallel.tp_rank, parallel.tp_size, torch.cuda.current_device(),
+        catalog.layer_ids, config.lookup_mode, config.query_backend,
+        config.pipeline_enabled, config.prefetch_enabled, prefetch_layer_ids,
+        config.num_threads,
+        config.thread_pool_queue_depth, config.io_uring_queue_depth,
         config.cache_bytes, config.chunk_rows,
     )
     return original_fn(

@@ -31,11 +31,16 @@ class EngramSsdConfig:
     io_uring_queue_depth: int
     chunk_rows: int
     dedup_enabled: bool = False
+    sched_prefetch_enabled: bool = False
 
 
 def should_register_hooks() -> bool:
     # 登记阶段不抛错；非法值在进入原模型加载函数前统一拒绝。
     return os.getenv("SGLANG_ENABLE_DSV41_ENGRAM_SSD", "0").lower() not in _DISABLED_VALUES
+
+
+def should_register_sched_prefetch_hooks() -> bool:
+    return os.getenv("SGLANG_ENABLE_DSV41_ENGRAM_SSD_SCHED_PREFETCH", "0").lower() not in _DISABLED_VALUES
 
 
 def _boolean(name: str, default: str = "0") -> bool:
@@ -60,4 +65,5 @@ def get_config() -> EngramSsdConfig:
     return EngramSsdConfig(
         enabled=enabled, io_uring_queue_depth=queue_depth, chunk_rows=chunk_rows,
         dedup_enabled=_boolean("SGLANG_ENABLE_DSV41_ENGRAM_SSD_DEDUP"),
+        sched_prefetch_enabled=_boolean("SGLANG_ENABLE_DSV41_ENGRAM_SSD_SCHED_PREFETCH"),
     )

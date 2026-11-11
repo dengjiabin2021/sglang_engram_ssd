@@ -26,8 +26,11 @@ python -m pip install --no-deps --no-build-isolation -e ./sglang-engram-ssd
 | `SGLANG_DSV41_ENGRAM_SSD_CHUNK_ROWS` | `4096` | 单套同步中转区的行容量，必须为正 |
 | `SGLANG_DSV41_ENGRAM_SSD_IO_URING_QUEUE_DEPTH` | `32` | 在途文件请求数，必须为正；weight、scale 各占一个请求 |
 | `SGLANG_ENABLE_DSV41_ENGRAM_SSD_DEDUP` | `0` | 对整次本 rank 查询去重，读取唯一行后恢复重复位置 |
+| `SGLANG_ENABLE_DSV41_ENGRAM_SSD_SCHED_PREFETCH` | `0` | 调度预取总开关；当前阶段先捕获只读 CPU hash 参数 |
 
 去重在同步内部读取入口完成，保留原顺序、形状和 BF16 数值；关闭时不分配 unique／inverse 张量。
+
+CPU 行号计算直接调用官方 `compute_engram_hash_ids`，参数从模型已构造的 Hasher 复制，不重建 tokenizer，也不提前更新请求 history。其 Hook 仅随调度预取总开关登记。
 
 旧版读取选择、查询模式、按层预取、流水和 reader 缓存配置均已退役；显式设置只在启动时警告一次并忽略。配置只由 `config.py` 解析，非法值在原模型加载前拒绝。
 

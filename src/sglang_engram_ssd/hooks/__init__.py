@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..config import should_register_sched_prefetch_hooks
 from ._registry import HOOK_TARGETS
 
 # 保留原 hooks.py 的登记顺序：模型加载、权重加载、embedding。
@@ -30,3 +31,8 @@ __all__ = [
     "forward_ssd_embedding",
     "finish_ssd_embedding_load",
 ]
+
+if should_register_sched_prefetch_hooks():
+    from .engram_hasher import capture_request_hasher
+
+    __all__.append("capture_request_hasher")

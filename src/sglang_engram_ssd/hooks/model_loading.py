@@ -39,7 +39,7 @@ def load_model_with_engram_ssd(
 ) -> Any:
     # 必须先在模型加载调用链内校验；此处异常不再经过插件注册的捕获逻辑。
     config = get_config()
-    _check_hook_installation()
+    _check_hook_installation(sched_prefetch_enabled=config.sched_prefetch_enabled)
     from ..query.native import validate_native_reader
 
     validate_native_reader(io_uring_queue_depth=config.io_uring_queue_depth)

@@ -16,6 +16,7 @@ from .catalog import EngramSsdCatalog, get_engram_ssd_catalog
 from .config import get_config
 
 if TYPE_CHECKING:
+    from .hashing import RequestHasher
     from .query.native import NativeBatchRowReader
 
 
@@ -64,6 +65,7 @@ class EngramSsdRuntime:
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.dedup_enabled = dedup_enabled
+        self.hasher: RequestHasher | None = None
         self.tables: dict[int, EngramSsdTable] = {}
         self.fds: dict[Path, int] = {}
         self.lock = threading.Lock()
@@ -102,6 +104,11 @@ class EngramSsdRuntime:
         if path not in self.fds:
             self.fds[path] = os.open(path, os.O_RDONLY)
         return self.fds[path]
+
+    def set_request_hasher(self, *, hasher: RequestHasher) -> None:
+        if hasher.layer_ids != self.catalog.layer_ids:
+            raise ValueError("Engram CPU hash layer order differs from the checkpoint catalog")
+        self.hasher = hasher
 
     def init_table(self, layer_id: int) -> None:
         if layer_id in self.tables:

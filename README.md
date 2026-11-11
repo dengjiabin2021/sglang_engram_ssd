@@ -26,11 +26,20 @@ python -m pip install --no-deps --no-build-isolation -e ./sglang-engram-ssd
 | `SGLANG_DSV41_ENGRAM_SSD_CHUNK_ROWS` | `4096` | 单套同步中转区的行容量，必须为正 |
 | `SGLANG_DSV41_ENGRAM_SSD_IO_URING_QUEUE_DEPTH` | `32` | 在途文件请求数，必须为正；weight、scale 各占一个请求 |
 | `SGLANG_ENABLE_DSV41_ENGRAM_SSD_DEDUP` | `0` | 对整次本 rank 查询去重，读取唯一行后恢复重复位置 |
-| `SGLANG_ENABLE_DSV41_ENGRAM_SSD_SCHED_PREFETCH` | `0` | 调度预取总开关；当前阶段先捕获只读 CPU hash 参数 |
+| `SGLANG_ENABLE_DSV41_ENGRAM_SSD_SCHED_PREFETCH` | `0` | 调度预取总开关；捕获 CPU hash 参数并创建独立 pinned 行池 |
+| `SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_POOL_BYTES` | `2147483648` | 每 rank 行池 payload 预算，必须为正且至少容纳一行 |
+| `SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_SEGMENT_TOKENS` | `0` | 段大小；0 随 scheduler 的 chunk 大小，未启用 chunk 时为 8192 |
+| `SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_POLICY` | `timeout` | `best_effort`、`wait_complete`、`timeout` |
+| `SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_TIMEOUT_MS` | `500` | timeout 策略的非负等待毫秒数；其他策略显式设置会警告并忽略 |
+| `SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_LOG_INTERVAL` | `0` | 每 N 次 prefill 打印统计，0 关闭 |
 
 去重在同步内部读取入口完成，保留原顺序、形状和 BF16 数值；关闭时不分配 unique／inverse 张量。
 
 CPU 行号计算直接调用官方 `compute_engram_hash_ids`，参数从模型已构造的 Hasher 复制，不重建 tokenizer，也不提前更新请求 history。其 Hook 仅随调度预取总开关登记。
+
+行池保存两张连续 CPU pinned 表，起点均 4096 对齐，容量为 `POOL_BYTES//(D+D/32)`。同一层／行只占一个槽；零引用 READY 槽按 LRU 复用，PENDING 和有引用槽不得覆盖。该预算不包含元数据与对齐余量，不是整个进程 RSS 上限。
+
+调度预取关闭时不解析其数值／策略参数，显式设置只警告并忽略，不创建行池、后台线程或 CPU hash 副本。4096 对齐仅预留后续读取接口，本轮仍从原 checkpoint 正常读取，不包含 O_DIRECT 或合并格式。
 
 旧版读取选择、查询模式、按层预取、流水和 reader 缓存配置均已退役；显式设置只在启动时警告一次并忽略。配置只由 `config.py` 解析，非法值在原模型加载前拒绝。
 

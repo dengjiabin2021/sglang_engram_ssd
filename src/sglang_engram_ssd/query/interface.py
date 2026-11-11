@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     import torch
@@ -21,6 +21,15 @@ class RowTableSpec:
     scale_fd: int
     weight_offset: int
     scale_offset: int
+
+
+@dataclass(frozen=True)
+class PoolResolution:
+    """CPU 槽位／命中掩码和一次临时引用；GPU gather 完成后必须 release handle。"""
+
+    slot_ids: torch.Tensor
+    hit_mask: torch.Tensor
+    handle: Any
 
 
 class BatchRowReader(Protocol):
@@ -50,4 +59,15 @@ class BatchRowReader(Protocol):
 
     def close(self) -> None:
         """先结束读取再释放 ring；从不关闭 runtime 借出的 FD。"""
+        ...
+
+    def read_rows_to_slots(
+        self, *, layer_id: int, row_ids: torch.Tensor, slot_ids: torch.Tensor,
+        weight_base: torch.Tensor, scale_base: torch.Tensor,
+    ) -> None:
+        """CPU int64 [Q] 全局行号及槽号，写入 CPU uint8 [S,D]／[S,D/32]。
+
+        槽位由行池保留，调用期间不得回收。同步返回且释放 GIL，失败输出不可用。
+        行步长从输出 Tensor 读取，调用者不计算文件偏移；FD 仍由 runtime 持有。
+        """
         ...

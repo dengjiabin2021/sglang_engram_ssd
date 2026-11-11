@@ -3,6 +3,6 @@
 from __future__ import annotations
 
 from .interface import BatchRowReader, RowTableSpec
-from .native import NativeBatchRowReader
+from .native import NativeBatchRowReader, NativePrefetchRowPool
 
-__all__ = ["BatchRowReader", "NativeBatchRowReader", "RowTableSpec"]
+__all__ = ["BatchRowReader", "NativeBatchRowReader", "NativePrefetchRowPool", "RowTableSpec"]

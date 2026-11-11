@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -17,7 +17,8 @@ from .config import get_config
 
 if TYPE_CHECKING:
     from .hashing import RequestHasher
-    from .query.native import NativeBatchRowReader
+    from .query.native import NativeBatchRowReader, NativePrefetchRowPool
+    from .sched_prefetch import SchedulerPrefetchController
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,9 @@ class EngramSsdRuntime:
         io_uring_queue_depth: int,
         device: torch.device,
         dedup_enabled: bool = False,
+        sched_prefetch_enabled: bool = False,
+        pool_bytes: int = 2147483648,
+        log_interval: int = 0,
     ) -> None:
         if tp_size <= 0 or not 0 <= tp_rank < tp_size:
             raise ValueError("Engram SSD requires a valid TP rank and size")
@@ -66,6 +70,12 @@ class EngramSsdRuntime:
         self.tp_size = tp_size
         self.dedup_enabled = dedup_enabled
         self.hasher: RequestHasher | None = None
+        self.sched_prefetch_enabled = sched_prefetch_enabled
+        self.stats_enabled = bool(log_interval)
+        self.pool: NativePrefetchRowPool | None = None
+        self.sched_prefetch: SchedulerPrefetchController | None = None
+        self._pool_uses: list[tuple[torch.cuda.Event, Any, torch.Tensor]] | None = None
+        self._pool_uses_lock: threading.Lock | None = None
         self.tables: dict[int, EngramSsdTable] = {}
         self.fds: dict[Path, int] = {}
         self.lock = threading.Lock()
@@ -96,6 +106,12 @@ class EngramSsdRuntime:
             )
             self.device_ids = torch.arange(chunk_rows, dtype=torch.int64, device=device)
             self._chunk_done = torch.cuda.Event()
+            if sched_prefetch_enabled:
+                from .query import NativePrefetchRowPool
+
+                self.pool = NativePrefetchRowPool(dim=dim, pool_bytes=pool_bytes, track_stats=self.stats_enabled)
+                self._pool_uses = []
+                self._pool_uses_lock = threading.Lock()
         except BaseException:
             self.close()
             raise
@@ -109,6 +125,27 @@ class EngramSsdRuntime:
         if hasher.layer_ids != self.catalog.layer_ids:
             raise ValueError("Engram CPU hash layer order differs from the checkpoint catalog")
         self.hasher = hasher
+
+    def get_sched_prefetch(self, *, scheduler: Any) -> SchedulerPrefetchController:
+        from .sched_prefetch import get_manager
+
+        self.collect_pool_uses()
+        return get_manager(runtime=self, scheduler=scheduler)
+
+    def collect_pool_uses(self, *, wait: bool = False) -> None:
+        """只在 gather 的 CUDA event 完成后归还临时引用，普通调度检查不等待。"""
+        if self.pool is None or self._pool_uses_lock is None or self._pool_uses is None:
+            return
+        with self._pool_uses_lock:
+            pending = []
+            for event, handle, slot_ids in self._pool_uses:
+                if wait:
+                    event.synchronize()
+                if wait or event.query():
+                    self.pool.release(handle=handle)
+                else:
+                    pending.append((event, handle, slot_ids))
+            self._pool_uses = pending
 
     def init_table(self, layer_id: int) -> None:
         if layer_id in self.tables:
@@ -205,7 +242,14 @@ class EngramSsdRuntime:
         return out
 
     def close(self) -> None:
+        if self.sched_prefetch is not None:
+            self.sched_prefetch.close()
+            self.sched_prefetch = None
+        self.collect_pool_uses(wait=True)
         with self.lock:
+            if self.pool is not None:
+                self.pool.close()
+                self.pool = None
             if self.reader is not None:
                 self.reader.close()
                 self.reader = None
@@ -227,6 +271,8 @@ def get_engram_ssd_runtime(dim: int) -> EngramSsdRuntime:
         chunk_rows=config.chunk_rows, io_uring_queue_depth=config.io_uring_queue_depth,
         device=torch.device("cuda", torch.cuda.current_device()),
         dedup_enabled=config.dedup_enabled,
+        sched_prefetch_enabled=config.sched_prefetch_enabled, pool_bytes=config.pool_bytes,
+        log_interval=config.log_interval,
     )
     atexit.register(runtime.close)
     return runtime

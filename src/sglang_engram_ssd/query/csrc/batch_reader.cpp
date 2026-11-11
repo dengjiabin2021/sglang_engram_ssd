@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 #include <sys/types.h>
@@ -70,9 +71,46 @@ void BatchRowReader::read_rows(
   read_rows_uring(
       table,
       row_ids.data_ptr<std::int64_t>(),
+      nullptr,
       query_count,
       weight_out.data_ptr<std::uint8_t>(),
-      scale_out.data_ptr<std::uint8_t>());
+      scale_out.data_ptr<std::uint8_t>(),
+      weight_out.stride(0),
+      scale_out.stride(0));
+}
+
+void BatchRowReader::read_rows_to_slots(
+    std::int64_t layer_id,
+    const at::Tensor& row_ids,
+    const at::Tensor& slot_ids,
+    at::Tensor& weight_base,
+    at::Tensor& scale_base) {
+  const auto& table = open_table(layer_id);
+  check_inputs(table, row_ids, weight_base, scale_base);
+  TORCH_CHECK(
+      slot_ids.defined() && slot_ids.device().is_cpu() &&
+          slot_ids.scalar_type() == c10::ScalarType::Long &&
+          slot_ids.dim() == 1 && slot_ids.is_contiguous(),
+      "slot_ids must be contiguous CPU int64 [Q]");
+  TORCH_CHECK(slot_ids.size(0) == row_ids.size(0), "row_ids and slot_ids must have equal length");
+  std::unordered_set<std::int64_t> seen;
+  seen.reserve(static_cast<std::size_t>(slot_ids.numel()));
+  const auto* slots = slot_ids.data_ptr<std::int64_t>();
+  for (std::int64_t i = 0; i < slot_ids.numel(); ++i) {
+    if (slots[i] < 0 || slots[i] >= weight_base.size(0)) {
+      throw std::out_of_range("Engram SSD target slot is outside output capacity");
+    }
+    if (!seen.insert(slots[i]).second) {
+      throw std::invalid_argument("Engram SSD target slots must be unique");
+    }
+  }
+  if (row_ids.numel() == 0) {
+    return;
+  }
+  read_rows_uring(
+      table, row_ids.data_ptr<std::int64_t>(), slots, row_ids.numel(),
+      weight_base.data_ptr<std::uint8_t>(), scale_base.data_ptr<std::uint8_t>(),
+      weight_base.stride(0), scale_base.stride(0));
 }
 
 void BatchRowReader::close() {
@@ -159,27 +197,31 @@ std::int64_t BatchRowReader::row_offset(
 void BatchRowReader::read_rows_uring(
     const RowTableSpec& table,
     const std::int64_t* row_ids,
+    const std::int64_t* slot_ids,
     std::int64_t query_count,
     std::uint8_t* weights,
-    std::uint8_t* scales) {
+    std::uint8_t* scales,
+    std::int64_t weight_stride,
+    std::int64_t scale_stride) {
   const auto weight_bytes = table.dim;
   const auto scale_bytes = table.dim / 32;
   std::vector<IoReadRequest> requests;
   requests.reserve(static_cast<std::size_t>(query_count) * 2);
 
   // 先验证全部行并构造描述符，避免参数错误时留下访问输出内存的在途请求。
-  for (std::int64_t slot = 0; slot < query_count; ++slot) {
-    const auto row_id = row_ids[slot];
+  for (std::int64_t query = 0; query < query_count; ++query) {
+    const auto row_id = row_ids[query];
     if (row_id < 0 || row_id >= table.rows) {
       throw std::out_of_range(
           "Engram SSD row " + std::to_string(row_id) +
           " is outside layer " + std::to_string(table.layer_id));
     }
+    const auto slot = slot_ids == nullptr ? query : slot_ids[query];
     requests.push_back(IoReadRequest{
-        table.weight_fd, weights + slot * weight_bytes, weight_bytes,
+        table.weight_fd, weights + slot * weight_stride, weight_bytes,
         row_offset(table.weight_offset, row_id, weight_bytes)});
     requests.push_back(IoReadRequest{
-        table.scale_fd, scales + slot * scale_bytes, scale_bytes,
+        table.scale_fd, scales + slot * scale_stride, scale_bytes,
         row_offset(table.scale_offset, row_id, scale_bytes)});
   }
 

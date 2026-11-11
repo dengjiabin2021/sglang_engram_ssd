@@ -54,6 +54,18 @@ class BatchRowReader {
       at::Tensor& weight_out,
       at::Tensor& scale_out);
 
+  // row_ids/slot_ids 为等长 CPU contiguous int64 [Q]，slot_ids 必须互不重复。
+  // weight_base/scale_base 为 CPU contiguous uint8 [S,D]、[S,D/32]；只写指定槽位。
+  // 同步读满全部 weight/scale 后返回，失败也先回收所有在途请求；不发布池状态。
+  // 调用方保留 Tensor 与 PENDING 槽引用，返回后再 mark_ready；GPU 不能同时读这些槽。
+  // fd 只借用；不执行 CUDA 操作、不建立缓存，非法行号/槽号和 I/O 错误均抛出异常。
+  void read_rows_to_slots(
+      std::int64_t layer_id,
+      const at::Tensor& row_ids,
+      const at::Tensor& slot_ids,
+      at::Tensor& weight_base,
+      at::Tensor& scale_base);
+
   // 在所有读取结束后调用；释放自身资源，但不关闭外部传入的 fd。
   void close();
 
@@ -78,9 +90,12 @@ class BatchRowReader {
   void read_rows_uring(
       const RowTableSpec& table,
       const std::int64_t* row_ids,
+      const std::int64_t* slot_ids,
       std::int64_t query_count,
       std::uint8_t* weights,
-      std::uint8_t* scales);
+      std::uint8_t* scales,
+      std::int64_t weight_stride,
+      std::int64_t scale_stride);
 
   // 只保存表元数据；fd 仍由 runtime 持有。
   std::unordered_map<std::int64_t, RowTableSpec> tables_;

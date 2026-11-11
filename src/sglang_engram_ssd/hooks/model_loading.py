@@ -88,6 +88,10 @@ def load_model_with_engram_ssd(
 
     # 复用原模型的名称映射；只在 catalog 阶段核对所有 shape/dtype/文件偏移。
     hf_config = model_config.hf_config
+    if config.sched_prefetch_enabled:
+        row_bytes = hf_config.engram_head_dim + hf_config.engram_head_dim // 32
+        if config.pool_bytes < row_bytes:
+            raise ValueError("Engram SSD SCHED_PREFETCH_POOL_BYTES must hold at least one row")
     layer_rows = dict(zip(
         hf_config.engram_layer_ids,
         hf_config.engram_num_embeddings,

@@ -39,3 +39,27 @@ reader.close()
 调用同步返回前所有 CQE 已回收，短读、EINTR、完成项错误和未读满均显式处理。读取时释放 GIL；Python 包装保护单个 ring 的串行调用与关闭。reader 借用 runtime 的 FD，close 不关闭 FD。
 
 返回的 pinned 内存只能在 GPU 已停止读取后复用；runtime 用逐块 CUDA event 保证单套工作区生命周期。
+
+## 按槽位读取与 pinned 行池
+
+`read_rows_to_slots(layer_id=..., row_ids=..., slot_ids=..., weight_base=..., scale_base=...)`
+将 CPU 连续 int64 `[Q]` 全局行号写入指定的不同槽位，基表为 CPU uint8 `[S,D]`／`[S,D/32]`。
+它复用同一个 ring，释放 GIL 并同步收齐 I/O；文件定位与行步长只由 reader 解释，两个 FD 仍由 runtime 持有。
+
+`NativePrefetchRowPool(dim=..., pool_bytes=..., track_stats=False)` 提供：
+
+| 接口 | 生命周期约定 |
+|---|---|
+| `acquire(layer_id=..., row_ids=...)` | 去重并固定槽，返回 handle；空间不足返回 None，不阻塞；空行集合返回就绪空 handle |
+| `handle.missing_row_ids`／`missing_slot_ids` | 只包含本次新建 PENDING 行；同步读取返回后调用 `mark_ready(slot_ids=...)` |
+| `is_ready(handle=...)` | 全部槽 READY 才为真；失败 key 显式抛错 |
+| `resolve(layer_id=..., row_ids=...)` | 返回 `slot_ids`、`hit_mask`、临时 `handle`；只命中 READY，并保留输入顺序与重复 |
+| `release(handle=...)` | 归还引用；I/O 未完成的 PENDING 即使零引用也不能被复用 |
+| `cancel(handle=...)` | 仅在未提交 I/O 或 I/O 已收齐失败后撤销自建 PENDING；共享失败 key 显式报错直到全部引用归还 |
+| `stats()` | 锁内快照；累计计数只在 track_stats 时更新 |
+| `close()` | 要求全部 I/O 与引用已结束，存在 PENDING 或引用时拒绝关闭 |
+
+池的 `weight`／`scale` 为4096起点对齐的 pinned 表，`weight_device_ptr`／`scale_device_ptr` 供原生 gather 直接访问。
+行步长单独保存；当前两张表连续，分别为 D 和 D/32。slab 起点对齐不代表未来任意行读已经满足 DIO 对齐。
+
+每个 acquire／resolve handle 都由调用方释放。GPU gather 使用过的 resolve handle 必须等对应 CUDA event 完成后再 release；不能只因为 CPU 函数返回就归还槽位。

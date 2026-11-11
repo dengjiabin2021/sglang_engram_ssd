@@ -52,6 +52,7 @@ class EngramSsdRuntime:
         chunk_rows: int,
         io_uring_queue_depth: int,
         device: torch.device,
+        dedup_enabled: bool = False,
     ) -> None:
         if tp_size <= 0 or not 0 <= tp_rank < tp_size:
             raise ValueError("Engram SSD requires a valid TP rank and size")
@@ -62,6 +63,7 @@ class EngramSsdRuntime:
         self.device = device
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        self.dedup_enabled = dedup_enabled
         self.tables: dict[int, EngramSsdTable] = {}
         self.fds: dict[Path, int] = {}
         self.lock = threading.Lock()
@@ -156,6 +158,11 @@ class EngramSsdRuntime:
         from sglang.kernels.ops.embeddings.engram_gather import engram_gather
 
         table = self.open_table(layer_id=layer_id)
+        requested_shape = indices.shape
+        inverse = None
+        if self.dedup_enabled and indices.numel():
+            # 去重覆盖整个本地查询，而不是分别在每个 I/O chunk 中去重。
+            indices, inverse = torch.unique(indices.reshape(-1), sorted=True, return_inverse=True)
         out = torch.empty((*indices.shape, table.dim), dtype=torch.bfloat16, device=self.device)
         if not indices.numel():
             return out
@@ -186,6 +193,8 @@ class EngramSsdRuntime:
                 # 包括异常路径，旧 GPU 使用结束前都不允许复用 host/device 工作区。
                 self._chunk_done.record(torch.cuda.current_stream(device=self.device))
                 self._chunk_done.synchronize()
+        if inverse is not None:
+            return out.index_select(0, inverse).reshape(*requested_shape, table.dim)
         return out
 
     def close(self) -> None:
@@ -210,6 +219,7 @@ def get_engram_ssd_runtime(dim: int) -> EngramSsdRuntime:
         tp_rank=parallel.tp_rank, tp_size=parallel.tp_size,
         chunk_rows=config.chunk_rows, io_uring_queue_depth=config.io_uring_queue_depth,
         device=torch.device("cuda", torch.cuda.current_device()),
+        dedup_enabled=config.dedup_enabled,
     )
     atexit.register(runtime.close)
     return runtime

@@ -17,6 +17,45 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (8, 2)])
+def test_dedup_restores_positions_and_reduces_reads(
+    synthetic_catalog: Callable[..., tuple[EngramSsdCatalog, torch.Tensor, torch.Tensor]],
+    cuda_native_device: torch.device,
+    tp_size: int,
+    tp_rank: int,
+) -> None:
+    """A5：整次查询去重覆盖重复、跨chunk、owner过滤，恢复后逐位一致。"""
+    catalog, _, _ = synthetic_catalog(rows=23)
+    runtime = EngramSsdRuntime(
+        catalog=catalog, dim=256, tp_rank=tp_rank, tp_size=tp_size,
+        chunk_rows=3, io_uring_queue_depth=4, device=cuda_native_device,
+    )
+    counts: list[int] = []
+    assert runtime.reader is not None
+    read_rows = runtime.reader.read_rows
+
+    def record_rows(**kwargs) -> None:
+        counts.append(kwargs["row_ids"].numel())
+        read_rows(**kwargs)
+
+    runtime.reader.read_rows = record_rows
+    indices = torch.tensor([[5, 6, 5, 2], [20, 5, 6, 2]], dtype=torch.int64, device=cuda_native_device)
+    try:
+        baseline = runtime.lookup(layer_id=1, indices=indices)
+        baseline_count = sum(counts)
+        counts.clear()
+        runtime.dedup_enabled = True
+        actual = runtime.lookup(layer_id=1, indices=indices)
+        assert torch.equal(actual, baseline)
+        owner = indices.reshape(-1)
+        owner = owner[(owner >= 23 * tp_rank // tp_size) & (owner < 23 * (tp_rank + 1) // tp_size)]
+        assert baseline_count == owner.numel()
+        assert sum(counts) == owner.unique().numel()
+        assert sum(counts) < baseline_count
+    finally:
+        runtime.close()
+
+
 def _serial_owner_reference(
     *, weights: torch.Tensor, scales: torch.Tensor, indices: torch.Tensor, tp_rank: int, tp_size: int
 ) -> torch.Tensor:

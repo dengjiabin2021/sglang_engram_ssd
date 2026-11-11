@@ -30,6 +30,7 @@ class EngramSsdConfig:
     enabled: bool
     io_uring_queue_depth: int
     chunk_rows: int
+    dedup_enabled: bool = False
 
 
 def should_register_hooks() -> bool:
@@ -56,4 +57,7 @@ def get_config() -> EngramSsdConfig:
     chunk_rows = int(os.getenv("SGLANG_DSV41_ENGRAM_SSD_CHUNK_ROWS", "4096"))
     if queue_depth <= 0 or chunk_rows <= 0:
         raise ValueError("Engram SSD IO_URING_QUEUE_DEPTH and CHUNK_ROWS must be positive")
-    return EngramSsdConfig(enabled=enabled, io_uring_queue_depth=queue_depth, chunk_rows=chunk_rows)
+    return EngramSsdConfig(
+        enabled=enabled, io_uring_queue_depth=queue_depth, chunk_rows=chunk_rows,
+        dedup_enabled=_boolean("SGLANG_ENABLE_DSV41_ENGRAM_SSD_DEDUP"),
+    )

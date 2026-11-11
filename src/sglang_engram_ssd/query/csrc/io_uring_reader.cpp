@@ -12,7 +12,6 @@
 namespace sglang_engram_ssd::query {
 
 IoUringReader::IoUringReader(std::int64_t queue_depth) : queue_depth_(queue_depth) {
-#if ENGRAM_SSD_ENABLE_IO_URING
   if (queue_depth <= 0 ||
       queue_depth > static_cast<std::int64_t>(std::numeric_limits<unsigned>::max())) {
     throw std::invalid_argument("Invalid io_uring queue depth");
@@ -23,10 +22,6 @@ IoUringReader::IoUringReader(std::int64_t queue_depth) : queue_depth_(queue_dept
     throw std::system_error(-result, std::generic_category(), "io_uring_queue_init");
   }
   opened_ = true;
-#else
-  throw std::runtime_error(
-      "io_uring backend is not built; configure ENGRAM_SSD_ENABLE_IO_URING=ON");
-#endif
 }
 
 IoUringReader::~IoUringReader() {
@@ -34,7 +29,6 @@ IoUringReader::~IoUringReader() {
 }
 
 void IoUringReader::read_all(const std::vector<IoReadRequest>& requests) {
-#if ENGRAM_SSD_ENABLE_IO_URING
   if (!opened_) {
     throw std::runtime_error("io_uring reader is closed");
   }
@@ -61,22 +55,16 @@ void IoUringReader::read_all(const std::vector<IoReadRequest>& requests) {
     }
     read_window(window);
   }
-#else
-  throw std::runtime_error("io_uring backend is not built");
-#endif
 }
 
 void IoUringReader::close() {
-#if ENGRAM_SSD_ENABLE_IO_URING
   if (opened_) {
     // read_all 在返回或抛错前已收齐提交的 CQE；这里不把 queue_exit 当作 I/O 屏障。
     io_uring_queue_exit(&ring_);
     opened_ = false;
   }
-#endif
 }
 
-#if ENGRAM_SSD_ENABLE_IO_URING
 void IoUringReader::read_window(std::vector<PendingRead>& window) {
   while (true) {
     unsigned prepared = 0;
@@ -183,6 +171,5 @@ void IoUringReader::read_window(std::vector<PendingRead>& window) {
     // 本轮已经全部结束；下一轮只重提短读和 EINTR 的剩余部分。
   }
 }
-#endif
 
 }  // namespace sglang_engram_ssd::query

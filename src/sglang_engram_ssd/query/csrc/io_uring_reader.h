@@ -1,13 +1,11 @@
-// 可选的有界 io_uring 读取器；类定义在头文件，实现在 cpp。
+// 有界 io_uring 读取器；类定义在头文件，实现在 io_uring_reader.cpp。
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <vector>
 
-#if ENGRAM_SSD_ENABLE_IO_URING
 #include <liburing.h>
-#endif
 
 namespace sglang_engram_ssd::query {
 
@@ -32,7 +30,6 @@ class IoUringReader {
   void close();
 
  private:
-#if ENGRAM_SSD_ENABLE_IO_URING
   struct PendingRead {
     IoReadRequest request;
     std::int64_t received = 0;
@@ -42,7 +39,6 @@ class IoUringReader {
   // 每轮提交后收齐该轮 CQE，再重提短读或 EINTR 的剩余部分。
   void read_window(std::vector<PendingRead>& window);
   io_uring ring_{};
-#endif
 
   std::int64_t queue_depth_;
   bool opened_ = false;

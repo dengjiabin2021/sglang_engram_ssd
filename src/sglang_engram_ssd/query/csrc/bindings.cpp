@@ -3,8 +3,6 @@
 #include <pybind11/stl.h>
 
 #include <memory>
-#include <optional>
-#include <string>
 #include <vector>
 
 #include "batch_reader.h"
@@ -19,11 +17,7 @@ PYBIND11_MODULE(_C, module) {
   py::class_<BatchRowReader>(module, "BatchRowReader")
       .def(
           py::init([](const py::sequence& tables,
-                      std::int64_t cache_bytes,
-                      std::optional<std::int64_t> num_threads,
-                      std::optional<std::int64_t> thread_pool_queue_depth,
-                      std::optional<std::int64_t> io_uring_queue_depth,
-                      const std::string& io_backend) {
+                      std::int64_t io_uring_queue_depth) {
             // 这里只在构造时转换一次元数据。访问 Python 属性期间必须持有 GIL。
             std::vector<RowTableSpec> specs;
             specs.reserve(py::len(tables));
@@ -39,16 +33,11 @@ PYBIND11_MODULE(_C, module) {
               });
             }
             return std::make_unique<BatchRowReader>(
-                specs, cache_bytes, num_threads, thread_pool_queue_depth,
-                io_uring_queue_depth, io_backend);
+                specs, io_uring_queue_depth);
           }),
           py::arg("tables"),
           py::kw_only(),
-          py::arg("cache_bytes"),
-          py::arg("num_threads") = py::none(),
-          py::arg("thread_pool_queue_depth") = py::none(),
-          py::arg("io_uring_queue_depth") = py::none(),
-          py::arg("io_backend") = "pread")
+          py::arg("io_uring_queue_depth") = 32)
       .def(
           "allocate_workspace",
           &BatchRowReader::allocate_workspace,

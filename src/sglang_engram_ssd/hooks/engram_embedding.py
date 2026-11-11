@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+# sglang/srt/layers/engram.py：EngramEmbedding.__init__(
+#     self, num_embeddings: int, dim: int, layer_id: int)
 @register_hook(_EMBED_INIT, type=HookType.AROUND)
 def init_ssd_embedding(
     original_fn: Callable[..., Any],
@@ -36,20 +38,18 @@ def init_ssd_embedding(
     # 同进程各层 dim 相同，缓存 factory 返回同一 runtime；构造时统一 init_table。
     self.ssd = get_engram_ssd_runtime(dim=dim)
     self.tp_size = self.ssd.tp_size
-    if self.ssd.lookup_mode == "owner_allreduce":
-        # 按全局行号划分 owner；这里只记录范围，不分配完整 DDR/HBM 表。
-        self.row_start = num_embeddings * self.ssd.tp_rank // self.tp_size
-        row_end = num_embeddings * (self.ssd.tp_rank + 1) // self.tp_size
-        self.rows = row_end - self.row_start
-    else:
-        # all_queries 在任意 TP 规模下都处理全部查询。
-        self.row_start = 0
-        self.rows = num_embeddings
+    # 按全局行号划分 owner；这里只记录范围，不分配完整 DDR/HBM 表。
+    self.row_start = num_embeddings * self.ssd.tp_rank // self.tp_size
+    row_end = num_embeddings * (self.ssd.tp_rank + 1) // self.tp_size
+    self.rows = row_end - self.row_start
     self.host_table = None
     self.register_parameter("weight", None)
     self.register_parameter("scale", None)
 
 
+# sglang/srt/layers/engram.py：EngramEmbedding.forward(
+#     self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch] = None,
+#     *, cp_all_tokens: bool = False) -> torch.Tensor
 @register_hook(_EMBED_FORWARD, type=HookType.AROUND)
 def forward_ssd_embedding(
     original_fn: Callable[..., torch.Tensor],
@@ -66,21 +66,12 @@ def forward_ssd_embedding(
         raise ValueError("Engram SSD does not support context-parallel lookup")
     if forward_batch is not None and forward_batch.contains_mm_inputs():
         raise ValueError("Engram SSD currently supports text-only requests")
-    context = None
-    if runtime.prefetch_executor is not None:
-        from ..prefetch import get_current_prefetch
-
-        context = get_current_prefetch()
-    if context is not None:
-        # 后台预取只做本地查表，未选中层仍由 context 调用现有 SSD lookup。
-        out = context.lookup(layer_id=self.layer_id, indices=indices)
-    else:
-        out = runtime.lookup(layer_id=self.layer_id, indices=indices)
-    # owner 模式在模型原 Engram 位置每层合并一次，保持与主干 TP 通信的执行顺序。
-    # all_queries 和 TP=1 在 reduce_output 内直接返回，不额外通信。
+    out = runtime.lookup(layer_id=self.layer_id, indices=indices)
+    # 模型原 Engram 位置每层合并一次，保持与主干 TP 通信的执行顺序。
     return runtime.reduce_output(out)
 
 
+# sglang/srt/layers/engram.py：EngramEmbedding.finish_load(self, label: str)
 @register_hook(_EMBED_FINISH, type=HookType.AROUND)
 def finish_ssd_embedding_load(
     original_fn: Callable[..., Any], self: Any, label: str

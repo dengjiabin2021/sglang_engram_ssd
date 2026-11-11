@@ -36,19 +36,6 @@ class EngramSsdCatalog:
         return frozenset(self.views.keys())
 
 
-def read_exact_at(fd: int, size: int, offset: int) -> bytes:
-    """同步读满给定区间；短读继续读取，到文件末尾仍不足才报错。"""
-    parts: list[bytes] = []
-    received = 0
-    while received < size:
-        part = os.pread(fd, size - received, offset + received)
-        if not part:
-            raise EOFError(f"Checkpoint short read: offset={offset}, expected={size}, got={received}")
-        parts.append(part)
-        received += len(part)
-    return b"".join(parts)
-
-
 def read_safetensors_header(path: Path) -> tuple[dict, int]:
     with path.open("rb") as stream:
         prefix = stream.read(8)

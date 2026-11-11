@@ -34,5 +34,15 @@ __all__ = [
 
 if should_register_sched_prefetch_hooks():
     from .engram_hasher import capture_request_hasher
+    from .scheduler import (
+        filter_engram_candidates,
+        record_engram_batch,
+        register_waiting_request,
+        release_engram_prefill,
+        schedule_engram_prefill,
+    )
 
-    __all__.append("capture_request_hasher")
+    __all__.extend([
+        "capture_request_hasher", "register_waiting_request", "schedule_engram_prefill",
+        "filter_engram_candidates", "record_engram_batch", "release_engram_prefill",
+    ])

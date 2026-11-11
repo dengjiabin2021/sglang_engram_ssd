@@ -45,6 +45,26 @@ CPU 行号计算直接调用官方 `compute_engram_hash_ids`，参数从模型�
 
 ## 启动
 
+### 调度预取流程
+
+请求成功进入 waiting 队列后，插件保存完整纯文本 token 快照，从匹配 prefix 之后分段；每 rank 只有一个持久后台线程，计算 CPU 行号并向同一个 io_uring reader 提交本 rank 的缺失行。
+
+优先顺序为 chunked 请求下一段、waiting 请求各自首段，再补后续段；每个请求最多占有当前段与下一段。池满立即停止占槽，在后续调度中重试，不让 scheduler 等待 I/O。
+
+| 策略 | 放行规则 |
+|---|---|
+| `best_effort` | 全部放行，未就绪数据在 forward 补读 |
+| `wait_complete` | 下一段在全部 TP rank READY 才放行 |
+| `timeout` | 全部 rank 各自满足 READY 或提交后超时即可放行 |
+
+整批候选只通过一次 CPU gloo `all_reduce(MIN)` 得到一致结果，空候选不通信。未登记、池满或实际 prefix 比原计划更早的未覆盖请求，按入队 deadline 防止饿死；非 timeout 策略使用默认 500ms，不解析显式 TIMEOUT_MS。chunked continuation 不经过 waiting 筛选。
+
+原生 raw 调度会在内部加入 grammar-ready 请求并排序，因此新增 priority AFTER Hook 在该阶段结束后统一过滤；外层 AROUND 在返回时恢复暂缓请求及期间新入队项。run_batch AFTER 保存不可变 forward_iter／token 区间／generation，结果处理 AFTER 按此对账，避免 overlap 与 retract 的可变 Req 字段造成错误释放。
+
+后台异常在下一次调度或 forward 主路径抛出；后台不发 TP collective。abort、完成和 retract 释放请求引用；已提交 I/O 完成后才回收槽位。关闭顺序为停止提交、收齐后台、收齐 GPU 临时引用、关闭行池、reader、FD。
+
+### 服务命令
+
 ```bash
 SGLANG_PLUGINS=engram_ssd \
 SGLANG_ENABLE_DSV41_ENGRAM_SSD=1 \

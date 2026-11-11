@@ -82,6 +82,14 @@ python -m sglang.launch_server \
 
 当前只支持 NVIDIA CUDA、普通 TP、纯文本、非投机 prefill／decode；不支持 attention DP／CP、PP、PD、CUDA Graph。模型必须为本地 safetensors；禁止整 checkpoint 预取、startup overlap、IPC weight cache、自定义 loader 和禁用 mmap 的加载配置。
 
+## Forward 消费行池
+
+开启调度预取后的纯 prefill，真实 GPU Hasher 仍照常计算和提交 history。Embedding 将真实行号转到 CPU、筛选 owner 并 resolve 行池：READY 命中只上传槽位索引，原 `engram_gather` 直接访问池的 mapped pinned 指针，不搬运 weight／scale 到 HBM。
+
+未命中或 PENDING 行调用同一个内部同步读取函数补齐，并与命中结果一起恢复完整零张量；独立去重开关同样作用于这些补读。随后在原 Engram 层执行一次 TP all-reduce。decode、mixed batch 和空查询使用同步路径。
+
+resolve 的临时引用独立于请求段引用，GPU gather 完成事件未就绪时不回收。事件记录异常也不会将槽误当成已完成，关闭时先收齐对应生产流。运行期补读是预期行为，读取／后台错误仍直接传播，不切换读取后端。
+
 ## 验证状态
 
 本地 macOS 仅做源码静态检查，未编译、未运行 pytest 或模型。测试位于 `tests/`，原生和 CUDA 测试在目标环境执行；实际 TP8 数值、端到端和性能结果仍待验证。

@@ -66,7 +66,14 @@ def forward_ssd_embedding(
         raise ValueError("Engram SSD does not support context-parallel lookup")
     if forward_batch is not None and forward_batch.contains_mm_inputs():
         raise ValueError("Engram SSD currently supports text-only requests")
-    out = runtime.lookup(layer_id=self.layer_id, indices=indices)
+    if (
+        runtime.sched_prefetch_enabled and forward_batch is not None
+        and forward_batch.forward_mode.is_extend() and not forward_batch.forward_mode.is_mixed()
+    ):
+        out = runtime.lookup_from_pool(layer_id=self.layer_id, indices=indices)
+    else:
+        # Decode／mixed batch 不消费此行池，保留同步路径。
+        out = runtime.lookup(layer_id=self.layer_id, indices=indices)
     # 模型原 Engram 位置每层合并一次，保持与主干 TP 通信的执行顺序。
     return runtime.reduce_output(out)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from importlib import import_module, util
 from pathlib import Path
@@ -18,6 +19,8 @@ def cuda_native_device() -> torch.device:
         pytest.skip("A0 requires an NVIDIA CUDA device and the compiled io_uring extension")
     if util.find_spec("sglang_engram_ssd.query._C") is None:
         pytest.skip("A0 requires the compiled sglang_engram_ssd.query._C io_uring extension")
+    if "LOCAL_RANK" in os.environ:
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     # 已构建扩展的 ABI 或依赖错误应报错，不伪装成缺少测试依赖。
     import_module("sglang_engram_ssd.query._C")
     return torch.device("cuda", torch.cuda.current_device())

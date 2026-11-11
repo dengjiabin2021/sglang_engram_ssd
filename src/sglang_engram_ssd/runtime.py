@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import os
 import threading
+from time import perf_counter
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -43,6 +44,16 @@ class EngramSsdBuffer:
     device_scale: torch.Tensor
 
 
+@dataclass
+class PoolUse:
+    """GPU 临时引用；event 无法记录时保留生产流，关闭时再安全收齐。"""
+
+    event: torch.cuda.Event | None
+    handle: Any
+    slot_ids: torch.Tensor
+    stream: torch.cuda.Stream
+
+
 class EngramSsdRuntime:
     def __init__(
         self,
@@ -74,7 +85,7 @@ class EngramSsdRuntime:
         self.stats_enabled = bool(log_interval)
         self.pool: NativePrefetchRowPool | None = None
         self.sched_prefetch: SchedulerPrefetchController | None = None
-        self._pool_uses: list[tuple[torch.cuda.Event, Any, torch.Tensor]] | None = None
+        self._pool_uses: list[PoolUse] | None = None
         self._pool_uses_lock: threading.Lock | None = None
         self.tables: dict[int, EngramSsdTable] = {}
         self.fds: dict[Path, int] = {}
@@ -138,13 +149,16 @@ class EngramSsdRuntime:
             return
         with self._pool_uses_lock:
             pending = []
-            for event, handle, slot_ids in self._pool_uses:
+            for use in self._pool_uses:
                 if wait:
-                    event.synchronize()
-                if wait or event.query():
-                    self.pool.release(handle=handle)
+                    if use.event is None:
+                        use.stream.synchronize()
+                    else:
+                        use.event.synchronize()
+                if wait or (use.event is not None and use.event.query()):
+                    self.pool.release(handle=use.handle)
                 else:
-                    pending.append((event, handle, slot_ids))
+                    pending.append(use)
             self._pool_uses = pending
 
     def init_table(self, layer_id: int) -> None:
@@ -166,6 +180,8 @@ class EngramSsdRuntime:
 
     def lookup(self, layer_id: int, indices: torch.Tensor) -> torch.Tensor:
         """返回 GPU BF16 [...,D] 局部结果，非 owner 的查询位置为零；不做通信。"""
+        if self.sched_prefetch is not None:
+            self.sched_prefetch.raise_if_failed()
         self._check_indices(indices=indices)
         table = self.open_table(layer_id=layer_id)
         flat_ids = indices.reshape(-1)
@@ -183,6 +199,80 @@ class EngramSsdRuntime:
             )
             out.view(-1, table.dim).index_copy_(0, positions, values)
         torch.cuda.current_stream(device=self.device).synchronize()
+        return out
+
+    def lookup_from_pool(self, layer_id: int, indices: torch.Tensor) -> torch.Tensor:
+        """命中行直接从 pinned 表 gather；缺失行用原同步入口补读，保持 owner 语义。"""
+        if self.pool is None or not indices.numel():
+            return self.lookup(layer_id=layer_id, indices=indices)
+        if self.sched_prefetch is not None:
+            self.sched_prefetch.raise_if_failed()
+        self._check_indices(indices=indices)
+        self.collect_pool_uses()
+        table = self.open_table(layer_id=layer_id)
+        flat_ids = indices.detach().to(device="cpu", dtype=torch.int64).reshape(-1).contiguous()
+        if ((flat_ids < 0) | (flat_ids >= table.rows)).any().item():
+            raise IndexError(f"Engram layer {layer_id}: row IDs outside [0,{table.rows})")
+        lo = table.rows * self.tp_rank // self.tp_size
+        hi = table.rows * (self.tp_rank + 1) // self.tp_size
+        positions = torch.nonzero((flat_ids >= lo) & (flat_ids < hi), as_tuple=False).flatten()
+        out = torch.zeros((*indices.shape, table.dim), dtype=torch.bfloat16, device=self.device)
+        if not positions.numel():
+            out.record_stream(torch.cuda.current_stream(device=self.device))
+            return out
+        if self._pool_uses_lock is None or self._pool_uses is None:
+            raise RuntimeError("Engram pinned pool lifetime tracking is not initialized")
+        owner_ids = flat_ids.index_select(0, positions).contiguous()
+        stream = torch.cuda.current_stream(device=self.device)
+        event = torch.cuda.Event()
+        resolution = self.pool.resolve(layer_id=layer_id, row_ids=owner_ids)
+        # 保留索引张量直到对应 CUDA event 完成；临时 handle 保证 mapped 槽不被覆盖。
+        slot_ids = resolution.slot_ids
+        failed = False
+        try:
+            hits = int(resolution.hit_mask.sum().item())
+            misses = owner_ids.numel() - hits
+            miss_ms = 0.0
+            if hits:
+                from sglang.kernels.ops.embeddings.engram_gather import engram_gather
+
+                slot_ids = slot_ids[resolution.hit_mask].to(device=self.device).contiguous()
+                values = torch.empty((hits, self.dim), dtype=torch.bfloat16, device=self.device)
+                engram_gather(
+                    weight_ptr=self.pool.weight_device_ptr, scale_ptr=self.pool.scale_device_ptr,
+                    ids=slot_ids, out=values, dim=self.dim, block_size=32,
+                    row_lo=0, row_hi=self.pool.capacity,
+                )
+                destinations = positions[resolution.hit_mask].to(device=self.device)
+                out.view(-1, self.dim).index_copy_(0, destinations, values)
+            if misses:
+                missing = ~resolution.hit_mask
+                started = perf_counter() if self.stats_enabled else 0.0
+                values = self._read_rows_to_output(
+                    layer_id=layer_id, indices=owner_ids[missing].contiguous(),
+                )
+                if self.stats_enabled:
+                    miss_ms = (perf_counter() - started) * 1000
+                destinations = positions[missing].to(device=self.device)
+                out.view(-1, self.dim).index_copy_(0, destinations, values)
+            if self.stats_enabled:
+                self.pool.record_forward(hits=hits, misses=misses, miss_ms=miss_ms)
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            use = PoolUse(event=None, handle=resolution.handle, slot_ids=slot_ids, stream=stream)
+            try:
+                event.record(stream)
+                use.event = event
+            except BaseException:
+                # 不覆盖原读取异常，也不把未记录 event 当成 GPU 已完成。
+                if not failed:
+                    raise
+            finally:
+                with self._pool_uses_lock:
+                    self._pool_uses.append(use)
+        out.record_stream(torch.cuda.current_stream(device=self.device))
         return out
 
     def _check_indices(self, *, indices: torch.Tensor) -> None:
@@ -238,7 +328,7 @@ class EngramSsdRuntime:
                 self._chunk_done.record(torch.cuda.current_stream(device=self.device))
                 self._chunk_done.synchronize()
         if inverse is not None:
-            return out.index_select(0, inverse).reshape(*requested_shape, table.dim)
+            return out.index_select(0, inverse.to(device=self.device)).reshape(*requested_shape, table.dim)
         return out
 
     def close(self) -> None:

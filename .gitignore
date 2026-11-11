@@ -1,9 +1,5 @@
 __pycache__/
-*.py[cod]
+.pytest_cache/
 *.egg-info/
 build/
-dist/
-.venv/
-*.log
-.DS_Store
 src/sglang_engram_ssd/query/_C*.so

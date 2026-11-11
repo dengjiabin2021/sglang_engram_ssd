@@ -25,7 +25,8 @@ def _runtime(owner: Any) -> Any:
     return get_engram_ssd_runtime(dim=owner.model_config.hf_config.engram_head_dim)
 
 
-# sglang/srt/managers/scheduler.py: Scheduler._add_request_to_queue(self, req: Req, is_retracted: bool = False)
+# sglang/python/sglang/srt/managers/scheduler.py:
+# Scheduler._add_request_to_queue(self, req: Req, is_retracted: bool = False)
 @register_hook(_ADD_TO_QUEUE, type=HookType.AFTER)
 def register_waiting_request(
     function_result: Any, self: Any, req: Req, is_retracted: bool = False,
@@ -42,7 +43,7 @@ def register_waiting_request(
         )
 
 
-# sglang/srt/managers/scheduler.py: Scheduler._get_new_batch_prefill_raw(
+# sglang/python/sglang/srt/managers/scheduler.py: Scheduler._get_new_batch_prefill_raw(
 #     self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor], running_batch: ScheduleBatch)
 @register_hook(_GET_PREFILL, type=HookType.AROUND)
 def schedule_engram_prefill(
@@ -60,7 +61,7 @@ def schedule_engram_prefill(
     )
 
 
-# sglang/srt/managers/schedule_policy.py: SchedulePolicy.calc_priority(
+# sglang/python/sglang/srt/managers/schedule_policy.py: SchedulePolicy.calc_priority(
 #     self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None, processed_tokens: int = 0)
 @register_hook(_PREFILL_PRIORITY, type=HookType.AFTER)
 def filter_engram_candidates(
@@ -72,7 +73,7 @@ def filter_engram_candidates(
     filter_active_waiting_queue(waiting_queue=waiting_queue)
 
 
-# sglang/srt/managers/scheduler.py: Scheduler.run_batch(
+# sglang/python/sglang/srt/managers/scheduler.py: Scheduler.run_batch(
 #     self, batch: ScheduleBatch, pp_proxy_tensors: Optional[PPProxyTensors] = None)
 @register_hook(_RUN_BATCH, type=HookType.AFTER)
 def record_engram_batch(
@@ -84,7 +85,7 @@ def record_engram_batch(
         runtime.get_sched_prefetch(scheduler=self).record_batch(batch=batch)
 
 
-# sglang/srt/managers/scheduler_components/batch_result_processor.py:
+# sglang/python/sglang/srt/managers/scheduler_components/batch_result_processor.py:
 # SchedulerBatchResultProcessor.process_batch_result_prefill(
 #     self, batch: ScheduleBatch, result: Union[GenerationBatchResult, EmbeddingBatchResult])
 @register_hook(_RESULT_PREFILL, type=HookType.AFTER)

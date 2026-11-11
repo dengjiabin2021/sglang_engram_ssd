@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram import EngramLayout
 
 
-# sglang/srt/layers/engram.py：EngramHasher.__init__(
+# sglang/python/sglang/srt/layers/engram.py：EngramHasher.__init__(
 #     self, layout: EngramLayout, tokenizer, pad_id: int, compressed_vocab_size: int)
 @register_hook(_HASH_INIT, type=HookType.AFTER)
 def capture_request_hasher(

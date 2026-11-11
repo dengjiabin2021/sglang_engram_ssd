@@ -57,6 +57,7 @@ reader.close()
 | `release(handle=...)` | 归还引用；I/O 未完成的 PENDING 即使零引用也不能被复用 |
 | `cancel(handle=...)` | 仅在未提交 I/O 或 I/O 已收齐失败后撤销自建 PENDING；共享失败 key 显式报错直到全部引用归还 |
 | `stats()` | 锁内快照；累计计数只在 track_stats 时更新 |
+| `record_submitted(rows=...)` | 在实际交付 reader 前计数；acquire／取消占槽不算读取提交 |
 | `close()` | 要求全部 I/O 与引用已结束，存在 PENDING 或引用时拒绝关闭 |
 
 池的 `weight`／`scale` 为4096起点对齐的 pinned 表，`weight_device_ptr`／`scale_device_ptr` 供原生 gather 直接访问。

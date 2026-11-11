@@ -275,7 +275,22 @@ def test_concurrent_shared_handles(make_pool: Callable[..., Any]) -> None:
     assert all(not thread.is_alive() for thread in threads)
     assert not errors
     assert pool.stats()["referenced_slots"] == 0
-    assert pool.stats()["submitted_rows"] == 2
+    assert pool.stats()["submitted_rows"] == 0
+
+
+def test_submission_count_excludes_cancelled_reservations(make_pool: Callable[..., Any]) -> None:
+    """A3/R9：占槽后撤销不算读取提交；实际提交显式登记，复用仍按 acquire 统计。"""
+    pool = make_pool(slots=2)
+    handle = pool.acquire(layer_id=1, row_ids=ids([1, 1]))
+    assert pool.stats()["submitted_rows"] == 0
+    assert pool.stats()["dedup_saved_rows"] == 1
+    pool.cancel(handle=handle)
+    assert pool.stats()["submitted_rows"] == 0
+    pool.record_submitted(rows=3)
+    pool.record_submitted(rows=0)
+    assert pool.stats()["submitted_rows"] == 3
+    with pytest.raises(ValueError, match="non-negative"):
+        pool.record_submitted(rows=-1)
 
 
 def test_stats_optional_and_close_guard(make_pool: Callable[..., Any]) -> None:
@@ -285,6 +300,8 @@ def test_stats_optional_and_close_guard(make_pool: Callable[..., Any]) -> None:
         handle = pool.acquire(layer_id=1, row_ids=ids([1, 1, 2]))
         with pytest.raises(RuntimeError, match="released handles"):
             pool.close()
+        assert pool.stats()["submitted_rows"] == 0
+        pool.record_submitted(rows=2)
         publish(pool, handle)
         pool.record_forward(hits=3, misses=2, miss_ms=1.25)
         pool.record_deferred(count=4)

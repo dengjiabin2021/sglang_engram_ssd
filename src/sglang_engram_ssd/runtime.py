@@ -338,6 +338,15 @@ class EngramSsdRuntime:
         self.collect_pool_uses(wait=True)
         with self.lock:
             if self.pool is not None:
+                if self.stats_enabled:
+                    import json
+                    import logging
+
+                    stats = self.pool.stats()
+                    stats.update(phase="shutdown", tp_rank=self.tp_rank)
+                    logging.getLogger(__name__).info(
+                        "Engram SSD sched prefetch stats: %s", json.dumps(stats, sort_keys=True),
+                    )
                 self.pool.close()
                 self.pool = None
             if self.reader is not None:
@@ -347,6 +356,13 @@ class EngramSsdRuntime:
                 os.close(fd)
             self.fds.clear()
             self.tables.clear()
+            # 关闭后的 factory 对象可能仍被 lru_cache 持有，显式归还大块工作区。
+            self.buffer = None
+            self.device_ids = None
+            self._chunk_done = None
+            self.hasher = None
+            self._pool_uses = None
+            self._pool_uses_lock = None
 
 
 @lru_cache(maxsize=1)

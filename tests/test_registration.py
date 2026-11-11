@@ -9,7 +9,7 @@ import sys
 import pytest
 
 
-@pytest.mark.parametrize("ssd,sched", [("0", "0"), ("1", "0"), ("1", "1")])
+@pytest.mark.parametrize("ssd,sched", [("0", "0"), ("0", "1"), ("1", "0"), ("1", "1")])
 def test_feature_gated_registration(ssd: str, sched: str) -> None:
     """A1：独立进程避免已导入模块缓存影响，关闭时没有新增 Hook／运行期资源。"""
     environment = dict(os.environ)

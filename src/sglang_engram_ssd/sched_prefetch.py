@@ -251,6 +251,8 @@ class SchedulerPrefetchController:
                     self._release(handles=handles, cancel=True)
                     return []
                 if handle.missing_row_ids.numel():
+                    if self.config.log_interval:
+                        self.runtime.pool.record_submitted(rows=handle.missing_row_ids.numel())
                     self.runtime.reader.read_rows_to_slots(
                         layer_id=layer_id, row_ids=handle.missing_row_ids, slot_ids=handle.missing_slot_ids,
                         weight_base=self.runtime.pool.weight, scale_base=self.runtime.pool.scale,
@@ -430,8 +432,10 @@ class SchedulerPrefetchController:
                 self._retire_segments(state=state, end=span.end)
                 if state.completed_until >= len(state.token_ids):
                     self._discard_state(state=state)
+        if not self.config.log_interval:
+            return
         self._prefill_count += 1
-        if self.config.log_interval and self._prefill_count % self.config.log_interval == 0:
+        if self._prefill_count % self.config.log_interval == 0:
             stats = self.runtime.pool.stats()
             stats["phase"] = "prefill"
             stats["tp_rank"] = self.runtime.tp_rank

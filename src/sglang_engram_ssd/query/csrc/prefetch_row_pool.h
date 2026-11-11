@@ -51,8 +51,8 @@ struct PrefetchRowPoolStats {
   std::int64_t pending_slots = 0;
   std::int64_t ready_slots = 0;
   std::int64_t cached_slots = 0;
-  std::int64_t submitted_rows = 0;
-  std::int64_t dedup_saved_rows = 0;
+  std::int64_t submitted_rows = 0;  // 由实际读取调用方显式登记，不在占槽时计数。
+  std::int64_t dedup_saved_rows = 0;  // 成功 acquire 的输入行数减新占行数，包含登记复用。
   std::int64_t forward_hits = 0;
   std::int64_t forward_misses = 0;
   double miss_read_ms = 0;
@@ -110,6 +110,8 @@ class PrefetchRowPool : public std::enable_shared_from_this<PrefetchRowPool> {
   // 在锁下取得原生快照；占用状态总可读，累计统计只在 track_stats=true 时更新。
   PrefetchRowPoolStats stats() const;
 
+  // 实际向 reader 提交读取时同步记录非负行数；仅占槽/撤销不计，关闭统计时忽略。
+  void record_submitted(std::int64_t rows);
   // 同步记录非负行数与有限非负毫秒数；关闭统计时直接忽略，不执行 I/O。
   void record_forward(std::int64_t hits, std::int64_t misses, double miss_ms);
   // 同步记录非负暂缓请求数；关闭统计时直接忽略，不执行 I/O。

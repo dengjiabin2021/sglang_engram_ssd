@@ -144,6 +144,10 @@ PYBIND11_MODULE(_C, module) {
         return result;
       })
       .def(
+          "record_submitted", &PrefetchRowPool::record_submitted,
+          py::kw_only(), py::arg("rows"),
+          py::call_guard<py::gil_scoped_release>())
+      .def(
           "record_forward", &PrefetchRowPool::record_forward,
           py::kw_only(), py::arg("hits"), py::arg("misses"), py::arg("miss_ms"),
           py::call_guard<py::gil_scoped_release>())

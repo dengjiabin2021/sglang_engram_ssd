@@ -39,6 +39,7 @@ class FakePool:
         self._next_slot = 0
         self.cancelled = 0
         self.deferred = 0
+        self.submitted = 0
 
     def acquire(self, *, layer_id: int, row_ids: torch.Tensor) -> FakeHandle | None:
         with self._lock:
@@ -97,6 +98,9 @@ class FakePool:
 
     def record_deferred(self, *, count: int) -> None:
         self.deferred += count
+
+    def record_submitted(self, *, rows: int) -> None:
+        self.submitted += rows
 
 
 class FakeHasher:

@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-# sglang/srt/layers/engram.py：EngramEmbedding.__init__(
+# sglang/python/sglang/srt/layers/engram.py：EngramEmbedding.__init__(
 #     self, num_embeddings: int, dim: int, layer_id: int)
 @register_hook(_EMBED_INIT, type=HookType.AROUND)
 def init_ssd_embedding(
@@ -47,7 +47,7 @@ def init_ssd_embedding(
     self.register_parameter("scale", None)
 
 
-# sglang/srt/layers/engram.py：EngramEmbedding.forward(
+# sglang/python/sglang/srt/layers/engram.py：EngramEmbedding.forward(
 #     self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch] = None,
 #     *, cp_all_tokens: bool = False) -> torch.Tensor
 @register_hook(_EMBED_FORWARD, type=HookType.AROUND)
@@ -78,7 +78,7 @@ def forward_ssd_embedding(
     return runtime.reduce_output(out)
 
 
-# sglang/srt/layers/engram.py：EngramEmbedding.finish_load(self, label: str)
+# sglang/python/sglang/srt/layers/engram.py：EngramEmbedding.finish_load(self, label: str)
 @register_hook(_EMBED_FINISH, type=HookType.AROUND)
 def finish_ssd_embedding_load(
     original_fn: Callable[..., Any], self: Any, label: str

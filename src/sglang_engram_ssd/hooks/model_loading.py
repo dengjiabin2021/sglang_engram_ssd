@@ -26,6 +26,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# sglang/python/sglang/srt/model_executor/model_runner_components/load_model_utils.py:
+# load_model_with_memory_saver(*, model_config: ModelConfig, load_config: LoadConfig,
+#     device: str, gpu_id: int, memory_saver_adapter: Any, is_draft_worker: bool) -> LoadedModel
 @register_hook(_PREPARE_MODEL, type=HookType.AROUND)
 def load_model_with_engram_ssd(
     original_fn: Callable[..., Any],
@@ -120,6 +123,8 @@ def load_model_with_engram_ssd(
     )
 
 
+# sglang/python/sglang/srt/model_loader/loader.py:
+# get_model_loader(load_config: LoadConfig, model_config: Optional[ModelConfig] = None) -> BaseModelLoader
 @register_hook(_GET_LOADER, type=HookType.AROUND)
 def require_default_model_loader(
     original_fn: Callable[..., BaseModelLoader],

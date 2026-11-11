@@ -130,6 +130,9 @@ class NativePrefetchRowPool:
     def record_forward(self, *, hits: int, misses: int, miss_ms: float) -> None:
         self._pool.record_forward(hits=hits, misses=misses, miss_ms=miss_ms)
 
+    def record_submitted(self, *, rows: int) -> None:
+        self._pool.record_submitted(rows=rows)
+
     def record_deferred(self, *, count: int) -> None:
         self._pool.record_deferred(count=count)
 

@@ -336,7 +336,7 @@ std::shared_ptr<PrefetchRowHandle> PrefetchRowPool::acquire(
     throw;
   }
   if (track_stats_) {
-    counters_.submitted_rows += static_cast<std::int64_t>(missing.size());
+    // 这是登记复用统计；真正的读取提交由调用方另行 record_submitted。
     counters_.dedup_saved_rows += row_ids.numel() - static_cast<std::int64_t>(missing.size());
   }
   return handle;
@@ -470,6 +470,18 @@ PrefetchRowPoolStats PrefetchRowPool::stats() const {
   result.tracking_enabled = track_stats_;
   result.closed = closed_;
   return result;
+}
+
+void PrefetchRowPool::record_submitted(std::int64_t rows) {
+  if (!track_stats_) {
+    return;
+  }
+  if (rows < 0) {
+    throw std::invalid_argument("Engram prefetch submitted rows must be non-negative");
+  }
+  std::lock_guard lock(mutex_);
+  require_open();
+  counters_.submitted_rows += rows;
 }
 
 void PrefetchRowPool::record_forward(std::int64_t hits, std::int64_t misses, double miss_ms) {

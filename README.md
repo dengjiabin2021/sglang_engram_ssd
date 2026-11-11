@@ -26,7 +26,7 @@ python -m pip install --no-deps --no-build-isolation -e ./sglang-engram-ssd
 | `SGLANG_DSV41_ENGRAM_SSD_CHUNK_ROWS` | `4096` | 单套同步中转区的行容量，必须为正 |
 | `SGLANG_DSV41_ENGRAM_SSD_IO_URING_QUEUE_DEPTH` | `32` | 在途文件请求数，必须为正；weight、scale 各占一个请求 |
 | `SGLANG_ENABLE_DSV41_ENGRAM_SSD_DEDUP` | `0` | 对整次本 rank 查询去重，读取唯一行后恢复重复位置 |
-| `SGLANG_ENABLE_DSV41_ENGRAM_SSD_SCHED_PREFETCH` | `0` | 调度预取总开关；捕获 CPU hash 参数并创建独立 pinned 行池 |
+| `SGLANG_ENABLE_DSV41_ENGRAM_SSD_SCHED_PREFETCH` | `0` | 启用 waiting 分段预取、就绪调度和 pinned 行池消费 |
 | `SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_POOL_BYTES` | `2147483648` | 每 rank 行池 payload 预算，必须为正且至少容纳一行 |
 | `SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_SEGMENT_TOKENS` | `0` | 段大小；0 随 scheduler 的 chunk 大小，未启用 chunk 时为 8192 |
 | `SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_POLICY` | `timeout` | `best_effort`、`wait_complete`、`timeout` |
@@ -93,3 +93,34 @@ resolve 的临时引用独立于请求段引用，GPU gather 完成事件未就�
 ## 验证状态
 
 本地 macOS 仅做源码静态检查，未编译、未运行 pytest 或模型。测试位于 `tests/`，原生和 CUDA 测试在目标环境执行；实际 TP8 数值、端到端和性能结果仍待验证。
+
+在已构建新扩展的目标环境执行单元测试：
+
+```bash
+cd /workspace/sglang_engram_ssd
+python -m pytest -q tests/test_config.py tests/test_registration.py tests/test_hashing.py \
+  tests/test_prefetch_row_pool.py tests/test_sched_prefetch.py tests/test_runtime.py tests/test_pool_lookup.py
+torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_distributed.py
+```
+
+TP8 测试使用合成表和真实 NCCL，不需要加载完整模型。单 GPU 的 owner 模拟测试不等于真实多 rank 验证。
+服务端 A6～A8 按 [验收命令](tests/SERVICE_ACCEPTANCE.md) 执行，原路径和优化路径分开启动，最多同时驻留一套模型。
+
+## 统计日志
+
+`LOG_INTERVAL=N>0` 时每 N 次 prefill 输出 `Engram SSD sched prefetch stats: {JSON}`。
+累计计数在 C++ 中更新、锁内取快照；0 时不采样快照、不做补读计时或累计统计。
+
+| 字段 | 口径 |
+|---|---|
+| `submitted_rows` | 实际交付 reader 的预取缺失行数；仅占槽后取消不会计入，不含同步补读 |
+| `dedup_saved_rows` | 成功登记的输入行数减新占行数，包含段内重复与已有行复用；取消后不倒扣 |
+| `forward_hits`／`forward_misses` | forward 本 rank 的原始查询位置数；命中率用两者计算 |
+| `miss_read_ms` | 同步 miss 补读 wall time，包含等待 reader、H2D 和 gather，不是纯 SSD 时间 |
+| `deferred_requests` | 调度检查中被暂缓的请求次数，同一请求可多次计入 |
+| `occupied_slots`／`referenced_slots` | 当前占用／有引用槽位数；READY 缓存可占槽但引用为零 |
+
+日志带 `tp_rank` 和 `phase=prefill/idle/shutdown`；空闲引用归零记录每生命周期只打印一次，关闭时再取最终快照。
+验收 A7 要看全部 rank 的本轮 idle 归零状态，不能把中途快照或单 rank 结果当作全局无泄漏证明。
+
+完整交付范围、Hook 列表与待验证事项见 [DELIVERY.md](DELIVERY.md)。旧工作区基准脚本针对基线接口，需在基线 tag 使用；新分支使用插件内的验收脚本。

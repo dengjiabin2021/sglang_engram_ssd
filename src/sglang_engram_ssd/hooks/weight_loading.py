@@ -21,6 +21,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_loader.loader import DefaultModelLoader
 
 
+# sglang/python/sglang/srt/model_loader/loader.py：DefaultModelLoader._get_weights_iterator(
+#     self, source: Source, *, resolved_source: Optional[ResolvedSource] = None,
+#     startup_prefetch_started: bool = False, startup_prefetch_active: bool = False
+# ) -> Generator[Tuple[str, torch.Tensor], None, None]
 @register_hook(_WEIGHTS_ITERATOR, type=HookType.AROUND)
 def selective_weights_iterator(
     original_fn: Callable[..., Any],
@@ -31,6 +35,14 @@ def selective_weights_iterator(
     startup_prefetch_started: bool = False,
     startup_prefetch_active: bool = False,
 ) -> Any:
+    """用精确跳过大表的生成器替代默认权重迭代器。
+
+    输入：original_fn 为官方迭代器入口；self 为默认 loader；source 为主模型权重来源；
+        resolved_source 为可选的预解析文件集合；startup_prefetch_started／active 表示不受支持的整文件预取状态。
+    输出：惰性 (参数名, CPU 原 dtype／形状 Tensor) 迭代器，保留普通参数并跳过 catalog 中的原大表名。
+    有意不调用 original_fn，避免默认 buffered iterator 先 get_tensor；仍复用文件发现流程和加载计时起点。
+    非主模型、预取状态、非 safetensors 或 checkpoint 目录不一致时立即抛 ValueError。
+    """
     from sglang.srt.model_loader.weight_utils import maybe_add_mtp_safetensors
     from sglang.srt.runtime_context import get_model
 
@@ -69,6 +81,8 @@ def selective_weights_iterator(
     return ((source.prefix + name, tensor) for name, tensor in weights_iterator)
 
 
+# sglang/python/sglang/srt/models/deepseek_v4.py：DeepseekV4ForCausalLM.load_weights(
+#     self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False)
 @register_hook(_LOAD_WEIGHTS, type=HookType.AROUND)
 def load_weights_with_external_engram(
     original_fn: Callable[..., Any],
@@ -76,11 +90,23 @@ def load_weights_with_external_engram(
     weights: Iterable[Tuple[str, torch.Tensor]],
     is_nextn=False,
 ) -> Any:
+    """在交给原模型加载器前排除 canonical 名称匹配的外置 Engram 大表。
+
+    输入：original_fn 为官方 load_weights；self 为当前模型；weights 为 (名称, Tensor) 迭代器，
+        张量设备／dtype／形状沿用 loader，不要求统一布局；is_nextn 只能为 False。
+    输出：透传 original_fn 的加载结果；普通参数仍由原函数消费和写入模型，不修改输入 Tensor。
+    主路径已在 get_tensor 前跳过大表，本层只处理名称映射后的精确过滤；NextN 立即抛 ValueError。
+    """
     if is_nextn:
         raise ValueError("Engram SSD does not support NextN loading")
     external_names = get_engram_ssd_catalog().canonical_names
 
     def ordinary_weights() -> Iterable[Tuple[str, torch.Tensor]]:
+        """为原 load_weights 惰性筛选普通参数。
+
+        输入：无显式参数；借用外层 weights、self、is_nextn 和只读 external_names。
+        输出：逐项产出不属于外置大表的原 (名称, Tensor)，保持输入顺序、对象和所有权不变。
+        """
         # 正常路径已在 get_tensor 前过滤；这里补充规范化名称的外置参数识别。
         for name, tensor in weights:
             canonical = self.remap_weight_name_to_dpsk_hf_format(

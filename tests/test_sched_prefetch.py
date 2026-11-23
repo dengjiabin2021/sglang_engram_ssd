@@ -144,26 +144,32 @@ def environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[Environment]:
     config = SimpleNamespace(segment_tokens=2, policy="timeout", timeout_ms=500, log_interval=0)
     monkeypatch.setattr(sched_prefetch, "get_config", lambda: config)
     runtime = SimpleNamespace(
-        hasher=FakeHasher(), pool=FakePool(), reader=FakeReader(), tp_size=1, tp_rank=0,
+        hasher=FakeHasher(), pool=FakePool(), reader=FakeReader(), prefetch_reader=FakeReader(), tp_size=1, tp_rank=0,
         open_table=lambda layer_id: SimpleNamespace(rows=16),
         collect_pool_uses=lambda: None,
     )
-    scheduler = SimpleNamespace(waiting_queue=[], chunked_req=None, tp_group=SimpleNamespace(cpu_group=object()))
+    scheduler = SimpleNamespace(
+        waiting_queue=[], chunked_req=None, chunked_prefill_size=2, tp_group=SimpleNamespace(cpu_group=object()),
+    )
     manager = sched_prefetch.SchedulerPrefetchController(runtime=runtime, scheduler=scheduler)
     try:
         yield manager, runtime, scheduler, config
     finally:
-        runtime.reader.proceed.set()
+        runtime.prefetch_reader.proceed.set()
         manager.close()
 
 
 def _wait_segment(manager: Any, req: Any, index: int = 0, status: str = "ready") -> Any:
     state = manager.states[id(req)]
+    if not state.initialized:
+        manager._initialize_segments(state=state)
+        if state.segments:
+            manager._submit(state=state, segment=state.segments[0])
     with manager._condition:
         assert manager._condition.wait_for(
             lambda: state.segments[index].status == status or manager._failure is not None, timeout=5,
         )
-    manager.raise_if_failed()
+    assert manager._failure is None, f"Unexpected background error: {manager._failure!r}"
     assert state.segments[index].status == status
     return state
 
@@ -173,6 +179,431 @@ def _batch(req: Any, start: int, length: int, iteration: int) -> SimpleNamespace
         reqs=[req], prefix_lens=[start], extend_lens=[length], forward_iter=iteration,
         decoding_reqs=None, forward_mode=SimpleNamespace(is_extend=lambda: True),
     )
+
+
+def _filter_once(manager: Any, scheduler: Any) -> list[str]:
+    def original(self: Any, prefill_delayer_single_pass: Any, running_batch: Any) -> list[str]:
+        sched_prefetch.filter_active_waiting_queue(waiting_queue=self.waiting_queue)
+        return [req.rid for req in self.waiting_queue]
+
+    return manager.run_prefill(
+        original_fn=original, scheduler=scheduler, prefill_delayer_single_pass=None, running_batch=None,
+    )
+
+
+def test_registration_waits_for_priority_prefix_snapshot(environment: Environment) -> None:
+    """A7/P3：初次入队不读 SSD，priority 更新 prefix 后才切分未命中的后缀。"""
+    manager, runtime, scheduler, config = environment
+    config.policy = "best_effort"
+    req = _request("prefix-hit", [1, 2, 3, 4, 5, 6])
+    scheduler.waiting_queue = [req]
+    manager.register_request(req=req)
+    manager.reconcile(scheduler=scheduler)
+    state = manager.states[id(req)]
+    assert not state.initialized
+    assert not state.segments
+    assert not runtime.prefetch_reader.calls
+    req.prefix_len = 2  # 模拟支持 prefix 匹配的原生 priority 完成缓存查询。
+    assert _filter_once(manager=manager, scheduler=scheduler) == [req.rid]
+    _wait_segment(manager=manager, req=req)
+    _wait_segment(manager=manager, req=req, index=1)
+    assert [(segment.start, segment.end) for segment in state.segments] == [(2, 4), (4, 6)]
+    assert all(row not in (1, 2) for _, rows in runtime.prefetch_reader.calls for row in rows)
+    assert not runtime.reader.calls  # 后台独立 reader，不占用 forward 的 io_uring 实例。
+
+
+def test_priority_without_prefix_refresh_uses_existing_snapshot(environment: Environment) -> None:
+    """A7/P3：原生策略未刷新 prefix 时不自行改 KV 状态，使用当前快照预取。"""
+    manager, _, scheduler, config = environment
+    config.policy = "best_effort"
+    req = _request("no-fast-prefix", [1, 2], prefix=0)
+    scheduler.waiting_queue = [req]
+    manager.register_request(req=req)
+    assert _filter_once(manager=manager, scheduler=scheduler) == [req.rid]
+    state = _wait_segment(manager=manager, req=req)
+    assert state.segments[0].start == 0
+
+
+def test_cross_segment_chunk_requires_both_segments(environment: Environment) -> None:
+    """A7/P4：chunk 从段内开始并跨越两段时，不能仅凭首段 READY 放行。"""
+    manager, runtime, scheduler, config = environment
+    config.policy = "wait_complete"
+    manager.chunked_tokens = 3
+    runtime.prefetch_reader.proceed.clear()
+    req = _request("cross-segment", [1, 2, 3, 4])
+    scheduler.waiting_queue = [req]
+    manager.register_request(req=req)
+    state = manager.states[id(req)]
+    manager._initialize_segments(state=state)
+    state.segments[0].status = "ready"
+    req.prefix_len = 1
+    assert _filter_once(manager=manager, scheduler=scheduler) == []
+    segments, covered = manager._segments_for_next_chunk(state=state)
+    assert covered
+    assert segments == state.segments
+    runtime.prefetch_reader.proceed.set()
+    _wait_segment(manager=manager, req=req, index=1)
+    assert _filter_once(manager=manager, scheduler=scheduler) == [req.rid]
+
+
+@pytest.mark.parametrize("chunked_tokens", [0, 6])
+def test_chunk_larger_than_two_segments_uses_entry_deadline(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch, chunked_tokens: int,
+) -> None:
+    """A7/P4/N3：大 chunk 或未启用 chunk 的完整 prompt 超过两段时，按入队超时放行。"""
+    manager, _, scheduler, config = environment
+    clock = [100.0]
+    monkeypatch.setattr(sched_prefetch.time, "monotonic", lambda: clock[0])
+    config.policy = "wait_complete"
+    manager.chunked_tokens = chunked_tokens
+    req = _request("three-segments", [1, 2, 3, 4, 5, 6])
+    scheduler.waiting_queue = [req]
+    manager.register_request(req=req)
+    state = _wait_segment(manager=manager, req=req)
+    manager.reconcile(scheduler=scheduler)
+    _wait_segment(manager=manager, req=req, index=1)
+    assert state.segments[2].status == "new"
+    assert _filter_once(manager=manager, scheduler=scheduler) == []
+    clock[0] += 0.6
+    assert _filter_once(manager=manager, scheduler=scheduler) == [req.rid]
+
+
+def test_pool_full_retries_only_after_release_and_reuses_hash(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A7/P5：容量未变化时不重试；释放通知后复用 CPU 行号，不重复计算 hash。"""
+    manager, runtime, scheduler, _ = environment
+    calls = []
+    compute = runtime.hasher.compute_request_row_ids
+
+    def counted(*, token_ids: tuple[int, ...], start: int, end: int) -> torch.Tensor:
+        calls.append((start, end))
+        return compute(token_ids=token_ids, start=start, end=end)
+
+    monkeypatch.setattr(runtime.hasher, "compute_request_row_ids", counted)
+    runtime.pool.capacity = 2  # 第一层能占槽，第二层失败，必须回滚且不能触发自己的重试。
+    req = _request("retry", [1, 2])
+    scheduler.waiting_queue = [req]
+    manager.register_request(req=req)
+    state = _wait_segment(manager=manager, req=req, status="blocked")
+    cached_ids = state.segments[0].row_ids
+    for _ in range(4):
+        manager.reconcile(scheduler=scheduler)
+    assert state.segments[0].status == "blocked"
+    assert calls == [(0, 2)]
+    assert state.segments[0].row_ids is cached_ids
+    runtime.pool.capacity = 1024
+    manager.notify_pool_release()  # 模拟段引用或 CUDA event 完成后的临时引用归还。
+    manager.reconcile(scheduler=scheduler)
+    _wait_segment(manager=manager, req=req)
+    assert calls == [(0, 2)]
+    assert state.segments[0].row_ids is None
+
+
+def test_cancel_during_hash_does_not_restore_segment_cache(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A7/P5：hash 计算期间取消请求，不重新挂回已清理状态，也不提交 SSD 读取。"""
+    manager, runtime, scheduler, _ = environment
+    entered = threading.Event()
+    proceed = threading.Event()
+    compute = runtime.hasher.compute_request_row_ids
+
+    def delayed(*, token_ids: tuple[int, ...], start: int, end: int) -> torch.Tensor:
+        entered.set()
+        if not proceed.wait(timeout=5):
+            raise RuntimeError("test hash was not released")
+        return compute(token_ids=token_ids, start=start, end=end)
+
+    monkeypatch.setattr(runtime.hasher, "compute_request_row_ids", delayed)
+    req = _request("cancel-hash", [1, 2])
+    scheduler.waiting_queue = [req]
+    manager.register_request(req=req)
+    state = manager.states[id(req)]
+    manager._initialize_segments(state=state)
+    manager._submit(state=state, segment=state.segments[0])
+    try:
+        assert entered.wait(timeout=5)
+        scheduler.waiting_queue = []
+        manager.reconcile(scheduler=scheduler)
+        assert state.cancelled
+    finally:
+        proceed.set()
+    manager.close()
+    assert state.segments[0].row_ids is None
+    assert not runtime.prefetch_reader.calls
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_tp_background_failure_reaches_shared_candidate_min(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch, local_failure: bool,
+) -> None:
+    """A7/P7：同一次非空候选检查中，任一 rank 后台失败经一次 MIN 传播到全部 rank。"""
+    manager, runtime, scheduler, _ = environment
+    runtime.tp_size = 8
+    req = _request("failed-rank", [1, 2])
+    scheduler.waiting_queue = [req]
+    cause = OSError("synthetic background failure")
+    if local_failure:
+        with manager._condition:
+            manager._failure = cause
+        manager.register_request(req=req)  # 不允许入队 Hook 抢先抛异常、跳过后面的集合通信。
+    calls = []
+
+    def reduce(mask: torch.Tensor, op: Any, group: Any) -> None:
+        calls.append(mask.clone())
+        if local_failure:
+            assert mask[0].item() == -1
+        assert mask.numel() == 2  # 一个独立失败标志加一个候选，不增加第二次归约。
+        mask[0] = -1  # 模拟任一远端 rank 的失败标记，不把它混入放行标志。
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    with pytest.raises(RuntimeError, match="failed on a TP rank") as error:
+        _filter_once(manager=manager, scheduler=scheduler)
+    assert len(calls) == 1
+    assert error.value.__cause__ is (cause if local_failure else None)
+    assert scheduler.waiting_queue == [req]
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_raw_early_return_still_propagates_background_failure(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch, local_failure: bool,
+) -> None:
+    """A7/N1：仍有 waiting 请求的 raw 早退参加一次失败 MIN，本地或远端失败统一传播。"""
+    manager, runtime, scheduler, _ = environment
+    runtime.tp_size = 8
+    scheduler.waiting_queue = [_request("raw-return", [1, 2])]
+    cause = OSError("synthetic early-return failure")
+    if local_failure:
+        with manager._condition:
+            manager._failure = cause
+    calls = []
+
+    def reduce(mask: torch.Tensor, op: Any, group: Any) -> None:
+        calls.append(mask.clone())
+        assert mask.tolist() == ([-1] if local_failure else [1])
+        mask[0] = -1
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+
+    def original(self: Any, prefill_delayer_single_pass: Any, running_batch: Any) -> None:
+        return None
+
+    with pytest.raises(RuntimeError, match="failed on a TP rank") as error:
+        manager.run_prefill(
+            original_fn=original, scheduler=scheduler, prefill_delayer_single_pass=None, running_batch=None,
+        )
+    assert len(calls) == 1
+    assert error.value.__cause__ is (cause if local_failure else None)
+    assert sched_prefetch._active_schedule.get() is None
+
+
+def test_full_batch_early_return_starts_waiting_prefetch(environment: Environment) -> None:
+    """A7/N2：batch 满导致 priority 前早退时，仍在后台预取 waiting 首段并保留两段上限。"""
+    manager, runtime, scheduler, _ = environment
+    req = _request("waiting-behind-full-batch", [1, 2, 3, 4, 5, 6], prefix=2)
+    scheduler.waiting_queue = [req]
+    manager.register_request(req=req)
+    runtime.prefetch_reader.proceed.clear()
+    state = manager.states[id(req)]
+    assert not state.initialized
+
+    def original(self: Any, prefill_delayer_single_pass: Any, running_batch: Any) -> str:
+        return "batch-full"  # 模拟原生早退，不调用 priority Hook。
+
+    try:
+        result = manager.run_prefill(
+            original_fn=original, scheduler=scheduler, prefill_delayer_single_pass=None, running_batch=None,
+        )
+        assert result == "batch-full"
+        # run_prefill 已返回，后台 reader 才被允许完成；调度线程没有等待 SSD。
+        assert runtime.prefetch_reader.entered.wait(timeout=5)
+        assert state.initialized
+        assert [(segment.start, segment.end) for segment in state.segments] == [(2, 4), (4, 6)]
+        assert state.segments[0].status == "reading"
+        assert scheduler.waiting_queue == [req]
+        assert not runtime.reader.calls
+    finally:
+        runtime.prefetch_reader.proceed.set()
+    _wait_segment(manager=manager, req=req)
+    _wait_segment(manager=manager, req=req, index=1)
+
+
+@pytest.mark.parametrize("use_priority", [False, True])
+@pytest.mark.parametrize("local_failure", [False, True])
+@pytest.mark.parametrize("residual_state", [False, True])
+def test_decode_without_prefill_demand_skips_failure_min(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch, use_priority: bool,
+    local_failure: bool, residual_state: bool,
+) -> None:
+    """A7/N4：无 waiting／chunked 时只对账一次，不按本地错误或残留 state 决定通信。"""
+    manager, runtime, scheduler, _ = environment
+    runtime.tp_size = 8
+    if residual_state:
+        req = _request("residual-prefetch-state", [1, 2])
+        scheduler.waiting_queue = [req]
+        manager.register_request(req=req)
+        scheduler.waiting_queue = []
+    cause = OSError("synthetic deferred failure")
+    if local_failure:
+        with manager._condition:
+            manager._failure = cause
+            manager._stopping = True
+    reconciled = []
+    reconcile = manager.reconcile
+
+    def counted_reconcile(*, scheduler: Any) -> None:
+        reconciled.append(scheduler)
+        reconcile(scheduler=scheduler)
+
+    def reject_collective(mask: torch.Tensor, op: Any, group: Any) -> None:
+        raise AssertionError("Pure decode must not issue a CPU failure collective")
+
+    def original(self: Any, prefill_delayer_single_pass: Any, running_batch: Any) -> None:
+        if use_priority:
+            sched_prefetch.filter_active_waiting_queue(waiting_queue=self.waiting_queue)
+        return None
+
+    monkeypatch.setattr(manager, "reconcile", counted_reconcile)
+    monkeypatch.setattr(torch.distributed, "all_reduce", reject_collective)
+    assert manager.run_prefill(
+        original_fn=original, scheduler=scheduler, prefill_delayer_single_pass=None, running_batch=None,
+    ) is None
+    assert reconciled == [scheduler]
+    assert manager._failure is (cause if local_failure else None)
+    # 失败 rank 保留状态、健康 rank 已清理，仍必须在两边都跳过，而不是按 states 大小分流。
+    assert bool(manager.states) == (residual_state and local_failure)
+    assert sched_prefetch._active_schedule.get() is None
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_new_waiting_request_resumes_deferred_failure_min(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch, local_failure: bool,
+) -> None:
+    """A7/N4：纯 decode 暂存失败，新 waiting 请求到达后的第一次 raw 调度恢复一次 MIN。"""
+    manager, runtime, scheduler, _ = environment
+    runtime.tp_size = 8
+    cause = OSError("synthetic deferred background failure")
+    if local_failure:
+        with manager._condition:
+            manager._failure = cause
+            manager._stopping = True
+    calls = []
+
+    def reduce(mask: torch.Tensor, op: Any, group: Any) -> None:
+        calls.append(mask.clone())
+        assert mask.tolist() == ([-1] if local_failure else [1])
+        mask[0] = -1  # 健康 rank 也必须通过同一次 MIN 得知远端积压的错误。
+
+    def original(self: Any, prefill_delayer_single_pass: Any, running_batch: Any) -> None:
+        return None
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    assert manager.run_prefill(
+        original_fn=original, scheduler=scheduler, prefill_delayer_single_pass=None, running_batch=None,
+    ) is None
+    assert not calls
+    req = _request("first-waiting-after-decode", [0, 1])
+    scheduler.waiting_queue = [req]
+    manager.register_request(req=req)
+    if local_failure:
+        assert id(req) not in manager.states  # 失败后不再登记，但原生 waiting 仍触发统一归约。
+    with pytest.raises(RuntimeError, match="failed on a TP rank") as error:
+        manager.run_prefill(
+            original_fn=original, scheduler=scheduler, prefill_delayer_single_pass=None, running_batch=None,
+        )
+    assert len(calls) == 1
+    assert error.value.__cause__ is (cause if local_failure else None)
+    assert scheduler.waiting_queue == [req]
+    assert sched_prefetch._active_schedule.get() is None
+
+
+def test_grammar_added_inside_raw_resumes_waiting_prefetch(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A7/N2/N4：入口无 waiting，原生内部追加 grammar-ready 后仍预取并恢复失败同步。"""
+    manager, runtime, scheduler, _ = environment
+    runtime.tp_size = 8
+    req = _request("grammar-ready-during-raw", [0, 1, 0, 1])
+    runtime.prefetch_reader.proceed.clear()
+    calls = []
+
+    def reduce(mask: torch.Tensor, op: Any, group: Any) -> None:
+        calls.append(mask.clone())
+        assert mask.tolist() == [1]
+
+    def original(self: Any, prefill_delayer_single_pass: Any, running_batch: Any) -> str:
+        self.waiting_queue.append(req)
+        manager.register_request(req=req)
+        return "batch-full-after-grammar"  # 原生 grammar 追加后仍可能因 batch 满在 priority 前返回。
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    try:
+        assert manager.run_prefill(
+            original_fn=original, scheduler=scheduler, prefill_delayer_single_pass=None, running_batch=None,
+        ) == "batch-full-after-grammar"
+        assert runtime.prefetch_reader.entered.wait(timeout=5)
+        assert manager.states[id(req)].initialized
+        assert scheduler.waiting_queue == [req]
+        assert len(calls) == 1
+    finally:
+        runtime.prefetch_reader.proceed.set()
+    _wait_segment(manager=manager, req=req)
+
+
+@pytest.mark.parametrize("use_priority", [False, True])
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_chunked_continuation_without_waiting_keeps_failure_min(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch, use_priority: bool, local_failure: bool,
+) -> None:
+    """A7/N1/N4：waiting 为空但存在 chunked continuation，仍统一传播本地或远端后台错误。"""
+    manager, runtime, scheduler, _ = environment
+    runtime.tp_size = 8
+    scheduler.chunked_req = _request("chunked-without-waiting", [0, 1, 0, 1])
+    cause = OSError("synthetic chunked background failure")
+    if local_failure:
+        with manager._condition:
+            manager._failure = cause
+            manager._stopping = True
+    calls = []
+
+    def reduce(mask: torch.Tensor, op: Any, group: Any) -> None:
+        calls.append(mask.clone())
+        assert mask.tolist() == ([-1] if local_failure else [1])
+        mask[0] = -1
+
+    def original(self: Any, prefill_delayer_single_pass: Any, running_batch: Any) -> None:
+        if use_priority:
+            sched_prefetch.filter_active_waiting_queue(waiting_queue=self.waiting_queue)
+        return None
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    with pytest.raises(RuntimeError, match="failed on a TP rank") as error:
+        manager.run_prefill(
+            original_fn=original, scheduler=scheduler, prefill_delayer_single_pass=None, running_batch=None,
+        )
+    assert len(calls) == 1
+    assert error.value.__cause__ is (cause if local_failure else None)
+    assert sched_prefetch._active_schedule.get() is None
+
+
+def test_queue_entry_owns_request_and_cleans_inactive_identity(environment: Environment) -> None:
+    """A7/P10：时间记录持有请求本身；相同 rid 的不同请求不混用身份或入队时间。"""
+    manager, _, scheduler, _ = environment
+    first = _request("same-rid", [1])
+    second = _request("same-rid", [2])
+    scheduler.waiting_queue = [first, second]
+    manager.register_request(req=first)
+    manager.register_request(req=second)
+    assert manager._queue_entered[id(first)].request is first
+    assert manager._queue_entered[id(second)].request is second
+    assert manager.states[id(first)].request is first
+    assert manager.states[id(second)].request is second
+    scheduler.waiting_queue = [second]
+    manager.reconcile(scheduler=scheduler)
+    assert id(first) not in manager._queue_entered
+    assert id(first) not in manager.states
+    assert manager._queue_entered[id(second)].request is second
 
 
 def test_background_owner_reads_and_two_segment_limit(environment: Environment) -> None:
@@ -186,8 +617,8 @@ def test_background_owner_reads_and_two_segment_limit(environment: Environment) 
     manager.reconcile(scheduler=scheduler)
     _wait_segment(manager=manager, req=req, index=1)
     assert state.segments[2].status == "new"
-    assert all(row >= 8 for _, rows in runtime.reader.calls for row in rows)
-    assert sum(rows.count(9) for _, rows in runtime.reader.calls) == 2  # 两个不同层各一次。
+    assert all(row >= 8 for _, rows in runtime.prefetch_reader.calls for row in rows)
+    assert sum(rows.count(9) for _, rows in runtime.prefetch_reader.calls) == 2  # 两个不同层各一次。
     assert manager._thread.is_alive()
 
 
@@ -232,8 +663,8 @@ def test_tp_timeout_uses_one_vector_min(environment: Environment, monkeypatch: p
 
     def reduce(mask: torch.Tensor, op: Any, group: Any) -> None:
         calls.append((mask.clone(), op, group))
-        assert mask.tolist() == [1, 1]
-        mask[1] = 0
+        assert mask.tolist() == [1, 1, 1]
+        mask[2] = 0
 
     monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
 
@@ -252,11 +683,19 @@ def test_tp_timeout_uses_one_vector_min(environment: Environment, monkeypatch: p
     assert [req.rid for req in scheduler.waiting_queue] == ["one", "two"]
 
 
-def test_empty_queue_does_not_call_collective(environment: Environment, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A7：候选为空不发TP集合通信，原函数异常也恢复调度上下文。"""
+def test_empty_queue_skips_failure_sync_and_restores_context(
+    environment: Environment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A7/N4：无 prefill 需求的空候选不通信，原函数异常仍恢复调度上下文。"""
     manager, runtime, scheduler, _ = environment
     runtime.tp_size = 8
-    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *a, **k: pytest.fail("unexpected collective"))
+    calls = []
+
+    def reduce(mask: torch.Tensor, op: Any, group: Any) -> None:
+        calls.append(mask.clone())
+        raise AssertionError("Empty decode scheduling must not issue a CPU collective")
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
 
     def original(self: Any, prefill_delayer_single_pass: Any, running_batch: Any) -> None:
         sched_prefetch.filter_active_waiting_queue(waiting_queue=self.waiting_queue)
@@ -267,6 +706,7 @@ def test_empty_queue_does_not_call_collective(environment: Environment, monkeypa
             original_fn=original, scheduler=scheduler, prefill_delayer_single_pass=None, running_batch=None,
         )
     assert sched_prefetch._active_schedule.get() is None
+    assert not calls
 
 
 def test_overlap_release_uses_batch_span_not_mutable_request(environment: Environment) -> None:
@@ -321,7 +761,7 @@ def test_partial_segment_reservation_rolls_back_pending(environment: Environment
     _wait_segment(manager=manager, req=req, status="blocked")
     assert runtime.pool.stats()["referenced"] == 0
     assert not runtime.pool.entries
-    assert not runtime.reader.calls
+    assert not runtime.prefetch_reader.calls
 
 
 def test_wait_complete_pool_full_uses_entry_timeout(environment: Environment, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -378,16 +818,19 @@ def test_prefix_shrink_is_not_mistaken_for_ready(environment: Environment, monke
 def test_abort_inflight_defers_release_until_read_finishes(environment: Environment) -> None:
     """A7：请求中止不提前复用在途I/O槽，读完成后唯一后台线程回收引用。"""
     manager, runtime, scheduler, _ = environment
-    runtime.reader.proceed.clear()
+    runtime.prefetch_reader.proceed.clear()
     req = _request("abort", [1, 2])
     scheduler.waiting_queue = [req]
     manager.register_request(req=req)
-    assert runtime.reader.entered.wait(timeout=5)
+    state = manager.states[id(req)]
+    manager._initialize_segments(state=state)
+    manager._submit(state=state, segment=state.segments[0])
+    assert runtime.prefetch_reader.entered.wait(timeout=5)
     scheduler.waiting_queue = []
     manager.reconcile(scheduler=scheduler)
     assert id(req) not in manager.states
     assert runtime.pool.stats()["referenced"] > 0
-    runtime.reader.proceed.set()
+    runtime.prefetch_reader.proceed.set()
     manager.close()
     assert runtime.pool.stats()["referenced"] == 0
 
@@ -395,14 +838,17 @@ def test_abort_inflight_defers_release_until_read_finishes(environment: Environm
 def test_background_error_is_rethrown(environment: Environment) -> None:
     """A7：后台SSD失败在下一次主路径传播，且不遗留PENDING或引用。"""
     manager, runtime, scheduler, _ = environment
-    runtime.reader.error = OSError("synthetic I/O error")
+    runtime.prefetch_reader.error = OSError("synthetic I/O error")
     req = _request("failure", [1, 2])
     scheduler.waiting_queue = [req]
     manager.register_request(req=req)
+    state = manager.states[id(req)]
+    manager._initialize_segments(state=state)
+    manager._submit(state=state, segment=state.segments[0])
     with manager._condition:
         assert manager._condition.wait_for(lambda: manager._failure is not None, timeout=5)
-    with pytest.raises(RuntimeError, match="scheduler prefetch failed"):
-        manager.raise_if_failed()
+    with pytest.raises(RuntimeError, match="failed on a TP rank"):
+        _filter_once(manager=manager, scheduler=scheduler)
     assert runtime.pool.stats()["referenced"] == 0
     assert not runtime.pool.entries
 

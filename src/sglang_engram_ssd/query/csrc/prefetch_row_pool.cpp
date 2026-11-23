@@ -1,3 +1,4 @@
+// pinned 行池的槽状态、引用与 LRU 实现；声明在 prefetch_row_pool.h，Python 绑定在 bindings.cpp。
 #include "prefetch_row_pool.h"
 
 #include <ATen/ops/empty.h>
@@ -20,6 +21,8 @@ namespace {
 
 constexpr std::int64_t kAlignment = 4096;
 
+// 输入 dim 为正数行宽 D 且为 32 的倍数，pool_bytes 为至少容纳一行的 payload 字节预算。
+// 返回槽位数 S；校验失败抛异常，不分配内存，也不修改池状态。
 std::int64_t pool_capacity(std::int64_t dim, std::int64_t pool_bytes) {
   if (dim <= 0 || dim % 32 != 0 || dim > std::numeric_limits<std::int64_t>::max() - dim / 32) {
     throw std::invalid_argument("Engram prefetch dim must be a positive multiple of 32");
@@ -30,6 +33,8 @@ std::int64_t pool_capacity(std::int64_t dim, std::int64_t pool_bytes) {
   return pool_bytes / (dim + dim / 32);
 }
 
+// 输入 ids 须为连续 CPU int64 [Q]，name 仅用于异常上下文；不限制重复值或数值范围。
+// 无返回值，不修改张量；非法输入抛异常，供行号和槽号入口共同复用。
 void check_ids(const at::Tensor& ids, const char* name) {
   TORCH_CHECK(ids.defined(), name, " must be defined");
   TORCH_CHECK(ids.device().is_cpu(), name, " must be on CPU");
@@ -37,6 +42,8 @@ void check_ids(const at::Tensor& ids, const char* name) {
   TORCH_CHECK(ids.dim() == 1 && ids.is_contiguous(), name, " must be contiguous [Q]");
 }
 
+// 输入非负 layer_id 和连续 CPU int64 [Q] 行号，可重复；无返回值，非法形状／负数抛异常。
+// 不修改张量。行号上限由 reader 按表行数检查，池本身不知道表大小。
 void check_rows(std::int64_t layer_id, const at::Tensor& row_ids) {
   check_ids(row_ids, "row_ids");
   if (layer_id < 0) {
@@ -50,6 +57,8 @@ void check_rows(std::int64_t layer_id, const at::Tensor& row_ids) {
   }
 }
 
+// 输入非负 layer_id 和连续 CPU int64 [Q] 非负行号，可重复。
+// 返回按首次出现顺序去重的行号副本；不修改输入，使 acquire 的每个槽在句柄内只占一个引用。
 std::vector<std::int64_t> unique_rows(std::int64_t layer_id, const at::Tensor& row_ids) {
   check_rows(layer_id, row_ids);
   std::vector<std::int64_t> rows;
@@ -65,6 +74,8 @@ std::vector<std::int64_t> unique_rows(std::int64_t layer_id, const at::Tensor& r
   return rows;
 }
 
+// 输入为只读整数向量；返回独立持有数据的连续 CPU int64 [Q]，不借用 vector 的地址。
+// 空输入保留一维空张量；分配失败抛异常，不修改输入。
 at::Tensor cpu_ids(const std::vector<std::int64_t>& values) {
   auto result = at::empty(
       {static_cast<std::int64_t>(values.size())}, at::TensorOptions().device(at::kCPU).dtype(at::kLong));
@@ -74,6 +85,10 @@ at::Tensor cpu_ids(const std::vector<std::int64_t>& values) {
   return result;
 }
 
+// 分配一张 [rows,width] 的 pinned uint8 表：多申请 kAlignment-1 字节，再截取 4096 对齐的视图。
+// storage 返回实际分配（持有内存），device_ptr 返回对齐视图起点在 GPU 侧的映射地址。
+// 映射地址按 storage 起点查询后加同样的偏移，保证 CPU 视图与 GPU 地址指向同一字节。
+// 4095B 是每张表显式申请的额外空间；pinned allocator 的取整／缓存开销另计，需在目标机测量。
 at::Tensor aligned_table(
     std::int64_t rows,
     std::int64_t width,
@@ -118,6 +133,7 @@ PrefetchRowPool::PrefetchRowPool(std::int64_t dim, std::int64_t pool_bytes, bool
       track_stats_(track_stats) {
   weight_ = aligned_table(capacity_, weight_stride_, weight_storage_, weight_device_ptr_);
   scale_ = aligned_table(capacity_, scale_stride_, scale_storage_, scale_device_ptr_);
+  // 初始时所有槽都是 FREE，按槽号顺序串成空闲链表。
   slots_.resize(static_cast<std::size_t>(capacity_));
   for (std::int64_t i = 0; i < capacity_; ++i) {
     slots_[i].next = i + 1 < capacity_ ? i + 1 : -1;
@@ -229,6 +245,7 @@ void PrefetchRowPool::pin(std::int64_t slot_id) {
   ++slot.references;
 }
 
+// 回收一个无引用的槽：READY 槽此时一定在 LRU 中，需要先摘除；PENDING 槽只会是被撤销的失败槽。
 void PrefetchRowPool::recycle(std::int64_t slot_id) {
   auto& slot = slots_[slot_id];
   if (slot.state == State::READY) {
@@ -249,6 +266,8 @@ void PrefetchRowPool::unpin(std::int64_t slot_id) {
   --slot.references;
   if (slot.references == 0) {
     --referenced_slots_;
+    // READY 进入 LRU 留作缓存；失败槽不能再被使用，直接回收。
+    // 正常 PENDING 不动：I/O 可能还在写，等 mark_ready 再进 LRU。
     if (slot.state == State::READY) {
       add_lru(slot_id);
     } else if (slot.failed) {
@@ -258,6 +277,7 @@ void PrefetchRowPool::unpin(std::int64_t slot_id) {
 }
 
 std::int64_t PrefetchRowPool::take_slot() {
+  // 调用方已检查过 free_slots_ + 可回收的 LRU 槽足够，所以这里 lru_tail_ 一定有效。
   if (free_head_ < 0) {
     recycle(lru_tail_);
   }
@@ -277,9 +297,11 @@ void PrefetchRowPool::release_slots(PrefetchRowHandle& handle) {
 
 std::shared_ptr<PrefetchRowHandle> PrefetchRowPool::acquire(
     std::int64_t layer_id, const at::Tensor& row_ids) {
+  // 去重和行号校验不需要池状态，放在锁外做。
   const auto rows = unique_rows(layer_id, row_ids);
   std::lock_guard lock(mutex_);
   require_open();
+  // 第一步：把输入行分成"池中已有"和"需要新建"两类，此时不修改任何状态。
   std::vector<std::int64_t> existing;
   std::vector<std::int64_t> missing;
   existing.reserve(rows.size());
@@ -298,7 +320,8 @@ std::shared_ptr<PrefetchRowHandle> PrefetchRowPool::acquire(
       }
     }
   }
-  // 本次也需要的缓存行先排除，不能为了新行将它们当作可淘汰空间。
+  // 第二步：检查空间。可用槽 = 空闲槽 + LRU 中的缓存槽，但本次要复用的缓存槽稍后会被 pin，
+  // 不能算作可回收空间。空间不足时直接返回，池状态保持不变。
   if (static_cast<std::int64_t>(missing.size()) > free_slots_ + cached_slots_ - protected_cached) {
     return nullptr;
   }
@@ -310,7 +333,8 @@ std::shared_ptr<PrefetchRowHandle> PrefetchRowPool::acquire(
       {static_cast<std::int64_t>(missing.size())}, at::TensorOptions().device(at::kCPU).dtype(at::kLong));
   auto* missing_slots = handle->missing_slot_ids_.data_ptr<std::int64_t>();
   try {
-    // 先固定全部现有行，再逐项回收 LRU，避免新行淘汰本次仍要用的缓存行。
+    // 第三步：先 pin 全部已有行，使它们离开 LRU；再为新行取槽，
+    // 这样 take_slot 回收 LRU 尾部时不会淘汰本次要复用的行。
     for (const auto slot_id : existing) {
       pin(slot_id);
       handle->slots_.push_back(slot_id);
@@ -329,6 +353,7 @@ std::shared_ptr<PrefetchRowHandle> PrefetchRowPool::acquire(
       index_.emplace(slot.key, slot_id);
     }
   } catch (...) {
+    // 中途失败（例如内存分配异常）：撤销已新建的槽并归还已加的引用，再抛出原异常。
     for (const auto slot_id : handle->created_slots_) {
       slots_[slot_id].failed = true;
     }
@@ -336,7 +361,7 @@ std::shared_ptr<PrefetchRowHandle> PrefetchRowPool::acquire(
     throw;
   }
   if (track_stats_) {
-    // 这是登记复用统计；真正的读取提交由调用方另行 record_submitted。
+    // 统计"本次无需新读"的行数（批内重复 + 池中已有）；实际提交读取的行数由调用方 record_submitted。
     counters_.dedup_saved_rows += row_ids.numel() - static_cast<std::int64_t>(missing.size());
   }
   return handle;
@@ -361,6 +386,7 @@ void PrefetchRowPool::mark_ready(const at::Tensor& slot_ids) {
   check_ids(slot_ids, "slot_ids");
   std::lock_guard lock(mutex_);
   require_open();
+  // 第一遍只检查、收集去重后的槽号；任一槽不合法就抛异常，不修改任何状态。
   std::unordered_set<std::int64_t> seen;
   seen.reserve(static_cast<std::size_t>(slot_ids.numel()));
   std::vector<std::int64_t> unique;
@@ -380,6 +406,7 @@ void PrefetchRowPool::mark_ready(const at::Tensor& slot_ids) {
     }
   }
   for (const auto slot_id : unique) {
+    // 第二遍发布：此时数据已写完。无引用的槽直接进入 LRU，可被后续请求复用或回收。
     auto& slot = slots_[slot_id];
     slot.state = State::READY;
     --pending_slots_;
@@ -391,7 +418,7 @@ void PrefetchRowPool::mark_ready(const at::Tensor& slot_ids) {
 }
 
 PrefetchRowResolution PrefetchRowPool::resolve(std::int64_t layer_id, const at::Tensor& row_ids) {
-  // 同样先校验全部行，非法输入不产生部分引用。
+  // 先校验输入并在锁外分配输出张量，缩短持锁时间；非法输入不会产生任何引用。
   check_rows(layer_id, row_ids);
   PrefetchRowResolution result;
   result.slot_ids = at::full({row_ids.numel()}, -1, at::TensorOptions().device(at::kCPU).dtype(at::kLong));
@@ -416,8 +443,9 @@ PrefetchRowResolution PrefetchRowPool::resolve(std::int64_t layer_id, const at::
       const auto slot_id = found->second;
       require_healthy(slots_[slot_id]);
       if (slots_[slot_id].state != State::READY) {
-        continue;
+        continue;  // PENDING 的行还在读，按未命中处理，由 forward 同步补读。
       }
+      // 同一槽可能被多个查询位置命中，只 pin 一次，避免句柄里出现重复引用。
       if (pinned.insert(slot_id).second) {
         pin(slot_id);
         result.handle->slots_.push_back(slot_id);
@@ -449,6 +477,7 @@ void PrefetchRowPool::cancel(const std::shared_ptr<PrefetchRowHandle>& handle) {
     return;
   }
   require_open();
+  // 只把本句柄新建、仍未读完的槽标记为失败；unpin 时无其他引用的失败槽会立即回收。
   for (const auto slot_id : handle->created_slots_) {
     if (slots_[slot_id].state == State::PENDING) {
       slots_[slot_id].failed = true;
@@ -511,6 +540,7 @@ void PrefetchRowPool::record_deferred(std::int64_t count) {
 }
 
 void PrefetchRowPool::close() {
+  // 在锁内把 Tensor 移到局部变量，函数返回时才析构，pinned 内存的释放不占用池锁。
   at::Tensor weight, scale, weight_storage, scale_storage;
   {
     std::lock_guard lock(mutex_);
@@ -533,7 +563,6 @@ void PrefetchRowPool::close() {
     free_slots_ = capacity_;
     ready_slots_ = cached_slots_ = 0;
   }
-  // pinned allocator 的回收在锁外完成，不与 acquire/resolve 的状态锁交织。
 }
 
 }  // namespace sglang_engram_ssd::query

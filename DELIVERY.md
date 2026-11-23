@@ -77,9 +77,9 @@ git log --reverse --oneline baseline-before-ssd-optimization..HEAD
 - `SGLANG_ENABLE_DSV41_ENGRAM_SSD_SCHED_PREFETCH`：R1～R6。
 - `SGLANG_ENABLE_DSV41_ENGRAM_SSD_DEDUP`：R7。
 
-调度预取关闭时，不登记六个新增 Hook，不建立 CPU hash 副本、行池或后台线程；从属数值参数只警告并忽略。其他策略不解析显式 TIMEOUT_MS，未提交请求的防饥饿 deadline 使用默认 500ms。
+调度预取关闭时，不登记六个新增 Hook，不建立 CPU hash 副本、行池、后台 reader 或后台线程；从属数值参数只警告并忽略。其他策略不解析显式 TIMEOUT_MS，未提交请求的防饥饿 deadline 使用默认 500ms。
 
-原生协议见 [query/README](src/sglang_engram_ssd/query/README.md) 及 `query/interface.py`。本次新增按槽读取、池 acquire／resolve／release／cancel／统计接口。IO 全部复用原 reader，pool 不定位或关闭 FD。
+原生协议见 [query/README](src/sglang_engram_ssd/query/README.md) 及 `query/interface.py`。本次新增按槽读取、池 acquire／resolve／release／cancel／统计接口。IO 复用同一 reader 实现；修正后前后台各持有一个独立实例，pool 不定位或关闭 FD。
 
 池基址对齐 4096，行步长保存在池中；这仅预留后续接口，**本轮没有合并存储、O_DIRECT 或多盘实现**。当前仍从原 checkpoint 两个张量读取。
 
@@ -87,7 +87,7 @@ git log --reverse --oneline baseline-before-ssd-optimization..HEAD
 
 | 需求第 8 节事项 | 静态结论 | 运行状态 |
 |---|---|---|
-| 完整 token、prefix 与位置 | `Req.refresh_fill_ids` 明确完整序列为 `origin_input_ids + output_ids`；入队使用其快照，起点用 `prefix_len`，段内保留绝对位置与前驱 | CPU／CUDA hash 一致性测试未运行 |
+| 完整 token、prefix 与位置 | 入队保存 `origin_input_ids + output_ids` 快照；首次筛选或 raw 提前返回边界按当前 prefix 切段，不自行修改 KV 缓存；不同 priority 策略不保证已匹配前缀 | CPU／CUDA hash 一致性测试未运行 |
 | waiting 队列别名 | raw 内有 grammar 追加、原地排序和 list 重绑定；以 priority Hook＋外层恢复处理 | CPU 替身测试已写，真实 scheduler 未运行 |
 | 结果处理类及 overlap | 目标是 frozen／slots 的 `SchedulerBatchResultProcessor`；状态放 runtime，`batch.copy` 保留 prefix_lens、extend_lens、forward_iter | span／generation 测试已写，真实 overlap 未运行 |
 | pinned GPU 读取性能 | 通过 CUDA 映射指针调用原 `engram_gather`，不另写反量化 kernel | 构建、映射、数值和性能均待目标机验证 |
@@ -126,3 +126,16 @@ prefix 缩小时，旧段 READY 不代表早于原覆盖起点的数据已就绪
 - 原生统计逐 rank 保留，不把时间求和当作整机关键路径延迟。
 - 行池预算是压缩 payload，元数据、对齐余量和其他工作区另计；READY 缓存占槽不等于引用泄漏。
 - CPU hash 成本、页缓存条件、GPU 访问 pinned 内存性能和实际 waiting 深度仍需报告，不能从源码推断优化倍数。
+
+## 8. 代码审查后的修正
+
+针对工作区 `ENGRAM_SSD_CODE_ISSUES.md` 的逐项判断、处理和测试入口见
+[CODE_REVIEW_RESOLUTION.md](CODE_REVIEW_RESOLUTION.md)。P1～P7、P9、P10 已修改实现及相关测试；P8 保留分配策略，等待目标环境确认分配器的实际开销。
+
+N1 删除 forward 与调度中的本地后台异常抛出，在有 prefill 需求的 raw 调度中统一归约失败。正常筛选附带失败标志；有 waiting／chunked 请求但提前返回时只归约该标志，每次至多一次。仅有 chunked 请求、候选为空时仍需失败归约，此处按用户 N1 建议调整原规范第 8.2 节及需求 R4.3 的空候选通信约束，不增加第二次通信或新配置。
+
+N4 在原生 waiting 为空且没有 `chunked_req` 时跳过归约和第二次对账，消除纯 decode 的额外 CPU collective；原生 raw 与首次对账保留，避免漏掉内部 grammar-ready 入队及 GPU 引用回收。不能用本地 `states` 决定跳过，因为后台失败后它不保证跨 rank 一致。积压后台错误保留至下一次 prefill 需求统一传播；前台 I/O／CUDA 错误仍直接传播。
+
+N2 在 raw 提前返回后为未切段 waiting 请求提交预取，恢复 batch 满时的排队重叠窗口；仍可能重复读取当前尚未匹配的缓存前缀。N3 保持无 chunk 长 prompt 的入队 deadline 补读，并明确 `wait_complete` 在超过两段容量时不保证等待全量完成。
+
+按更新后的规范第 10 节补全生产代码的中文类／函数 docstring、张量约定、状态转换及关键调用注释。没有新增配置或 Hook，也没有改变默认关闭的约束。修正仍仅完成静态检查；新增的原生读取、调度和 CUDA 回归测试均未运行，不据此声明性能提升或多 rank 验收通过。

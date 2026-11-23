@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
+from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from sglang_engram_ssd.catalog import EngramSsdCatalog
 from sglang_engram_ssd.runtime import EngramSsdRuntime
+from sglang_engram_ssd.sched_prefetch import SchedulerPrefetchController, SchedulingFrame
 
 pytestmark = pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 8,
@@ -78,5 +82,43 @@ def test_real_tp8_pool_matches_sync(
         if handle is not None:
             pool.release(handle=handle)
         runtime.close()
+        if owned_group:
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("flags", [(), (1, 0, 1)])
+def test_real_tp8_background_failure_uses_one_gloo_min(flags: tuple[int, ...]) -> None:
+    """A7/N1：真实八 rank CPU MIN 在有／无候选时均传播单 rank 后台错误。"""
+    import torch.distributed as dist
+
+    # 固定较短通信超时，使漏发 collective 的错误实现明确失败，避免目标机无限等待。
+    owned_group = not dist.is_initialized()
+    if owned_group:
+        dist.init_process_group(backend="gloo", timeout=timedelta(seconds=20))
+    cpu_group = dist.group.WORLD if owned_group else dist.new_group(
+        backend="gloo", timeout=timedelta(seconds=20),
+    )
+    rank = dist.get_rank()
+    try:
+        # 这里只需要真实归约，不创建 reader、模型或后台线程；只有 TP3 持有本地错误。
+        controller = object.__new__(SchedulerPrefetchController)
+        controller.runtime = SimpleNamespace(tp_size=dist.get_world_size())
+        controller.cpu_group = cpu_group
+        controller._condition = threading.Condition()
+        cause = OSError("synthetic background failure on TP3") if rank == 3 else None
+        controller._failure = cause
+        frame = SchedulingFrame(controller=controller, scheduler=SimpleNamespace(), original_queue=[])
+        with pytest.raises(RuntimeError, match="failed on a TP rank") as error:
+            controller._synchronize_flags(flags=flags, frame=frame)
+        assert frame.synchronized
+        assert error.value.__cause__ is cause
+
+        # 每个 rank 都须走过相同异常边界；本测试不让健康 rank 提前进入下一模型通信。
+        reached = torch.ones(1, dtype=torch.int32, device="cpu")
+        dist.all_reduce(reached, op=dist.ReduceOp.SUM, group=cpu_group)
+        assert reached.item() == 8
+    finally:
+        if not owned_group:
+            dist.destroy_process_group(cpu_group)
         if owned_group:
             dist.destroy_process_group()

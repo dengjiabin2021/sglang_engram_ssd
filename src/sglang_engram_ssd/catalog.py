@@ -13,30 +13,58 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class SsdTensorView:
-    path: Path
-    raw_key: str
+    """描述一个原始 safetensors 张量的位置，不持有 FD、映射或张量数据。
+
+    catalog 构建时创建，随后由 catalog 持有并供 runtime 只读共享；无资源关闭动作。
+    字段冻结，可跨线程读取；weight 行宽为 D，scale 行宽为 D/32，二者均以原始字节定位。
+    """
+
+    path: Path  # 原 shard 的绝对路径，不是导出或重排后的文件。
+    raw_key: str  # safetensors header 中的原参数名，用于加载阶段精确跳过大表。
     offset: int  # 在原 shard 中的绝对字节偏移，包含 8 字节长度和 JSON header。
-    rows: int
-    width: int
-    dtype: str
+    rows: int  # 张量全局行数；合法行号为 [0,rows)。
+    width: int  # 每行原始字节数，weight 为 D，scale 为 D/32。
+    dtype: str  # safetensors dtype 标记，仅允许已校验的 F8_E4M3 或 F8_E8M0。
 
 
 @dataclass(frozen=True)
 class EngramSsdCatalog:
-    root: Path
+    """汇总各 Engram 层原大表的元数据，不负责读取 payload 或持有文件资源。
+
+    模型加载 Hook 构建并安装进当前 worker，runtime 借用到退出；无需显式 close。
+    冻结字段中的 views 字典按只读约定共享，调用方不得并发修改；安装只在模型初始化阶段进行。
+    """
+
+    root: Path  # 当前 worker 绑定的原 checkpoint 绝对目录。
     views: dict[str, SsdTensorView]  # canonical 参数名 → 已校验的原张量位置。
     layer_ids: tuple[int, ...]      # 只保存配置中启用 Engram 的模型层号。
 
     @property
     def raw_names(self) -> frozenset[str]:
+        """取得应在 safetensors get_tensor 前跳过的大表原参数名。
+
+        输入：self 为已构建 catalog，无额外参数。
+        输出：不可变的原参数名集合；不读取文件、不修改目录元数据。
+        """
         return frozenset(view.raw_key for view in self.views.values())
 
     @property
     def canonical_names(self) -> frozenset[str]:
+        """取得模型名称映射后的外置大表参数名。
+
+        输入：self 为已构建 catalog，无额外参数。
+        输出：不可变的 canonical 参数名集合，用于 load_weights 的第二层过滤。
+        """
         return frozenset(self.views.keys())
 
 
 def read_safetensors_header(path: Path) -> tuple[dict, int]:
+    """只读取一个 shard 的 safetensors header，不物化权重张量。
+
+    输入：path 为本地 safetensors 文件路径，调用时须可读。
+    输出：(header 字典, payload 的绝对起始字节偏移)；函数同步读取并自行关闭临时文件句柄。
+    头长度或文件边界非法时抛 ValueError；文件和 JSON 错误原样传播。
+    """
     with path.open("rb") as stream:
         prefix = stream.read(8)
         if len(prefix) != 8:
@@ -55,6 +83,13 @@ def build_engram_ssd_catalog(
     layer_rows: dict[int, int],
     dim: int,
 ) -> EngramSsdCatalog:
+    """从 checkpoint 索引构建并校验 Engram weight／scale 的字节目录。
+
+    输入：root 为本地 checkpoint 目录；name_mapper 将原参数名映射为模型 canonical 名；
+        layer_rows 为启用层号到全局行数的映射，顺序决定 layer_ids；dim 为行宽 D，须为可被 32 整除的正二次幂。
+    输出：包含原 shard 路径、偏移、形状和 dtype 的 catalog，不读取大表 payload，也不安装全局状态。
+    文件在本调用内同步读取并关闭；缺表、形状／dtype／字节范围不符时抛 ValueError。
+    """
     # 形状和量化布局只在目录构建阶段检查；runtime 不重复校验配置。
     if not layer_rows:
         raise ValueError("The model has no configured Engram layers")
@@ -117,6 +152,12 @@ _CATALOG: EngramSsdCatalog | None = None
 
 
 def install_engram_ssd_catalog(catalog: EngramSsdCatalog) -> None:
+    """在模型初始化阶段将目录安装到当前 worker。
+
+    输入：catalog 为完整校验后的目录，调用方随后不得修改 views。
+    输出：无返回值；替换进程级目录引用，不复制 payload。已绑定其他 root 时抛 RuntimeError。
+    仅由串行模型加载路径调用，不提供运行期间切换模型或并发写保护。
+    """
     global _CATALOG
     # 当前实现一个 worker 绑定一个不可变模型目录。
     if _CATALOG is not None and _CATALOG.root != catalog.root:
@@ -125,6 +166,11 @@ def install_engram_ssd_catalog(catalog: EngramSsdCatalog) -> None:
 
 
 def get_engram_ssd_catalog() -> EngramSsdCatalog:
+    """借用当前 worker 已安装的只读目录。
+
+    输入：无显式参数；调用前须由模型加载 Hook 安装 catalog。
+    输出：进程共享的 EngramSsdCatalog 引用，不转移所有权；尚未安装时抛 RuntimeError。
+    """
     if _CATALOG is None:
         raise RuntimeError("Engram SSD catalog must be prepared before model construction")
     return _CATALOG

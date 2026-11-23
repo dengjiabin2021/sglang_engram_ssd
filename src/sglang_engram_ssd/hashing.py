@@ -14,20 +14,29 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class HashingState:
-    """由模型 hasher 复制的只读参数；张量独立持有，均为 CPU int64。"""
+    """持有官方 Hasher 参数的独立 CPU 快照，不计算 hash 或维护请求 history。
 
-    token_map: torch.Tensor  # [vocab_size]
-    multipliers: torch.Tensor  # [L, n]
-    primes: torch.Tensor  # [L, n - 1, H]
-    offsets: torch.Tensor  # [L, (n - 1) * H]
+    Hasher 构造后的 Hook 创建快照，runtime／RequestHasher 持有至关闭；无需显式释放资源。
+    frozen 只禁止字段替换，张量由调用方按只读约定使用，允许后台并发读取，不允许原地修改。
+    """
+
+    token_map: torch.Tensor  # 连续 CPU int64 [vocab_size]，原始 token 到压缩词表的映射。
+    multipliers: torch.Tensor  # 连续 CPU int64 [L,n]，n=max_ngram_size。
+    primes: torch.Tensor  # 连续 CPU int64 [L,n-1,H]，H=n_heads，C=(n-1)*H。
+    offsets: torch.Tensor  # 连续 CPU int64 [L,C]，各哈希列的全局表偏移。
     pad_id: int  # 官方 hasher 已映射到压缩词表的 PAD，不再经过 token_map。
     max_ngram_size: int
-    layer_ids: tuple[int, ...]
-    n_heads: int
+    layer_ids: tuple[int, ...]  # 与模型 layout 一致的 L 个层号顺序。
+    n_heads: int  # 每个 n-gram 长度使用的哈希头数 H。
 
     @classmethod
     def from_hasher(cls, hasher: EngramHasher, *, layer_ids: Sequence[int]) -> HashingState:
-        """在官方 hasher 构造后复制参数；层号必须使用构造时的 layout 顺序。"""
+        """在官方 Hasher 构造后复制参数并校验布局。
+
+        输入：hasher 为已初始化的官方 EngramHasher；layer_ids 为构造时 layout 的有序非空层号。
+            cls 为构造快照的类，张量来源可位于 GPU，但复制结果全部落在 CPU。
+        输出：独立持有连续 CPU int64 张量的 HashingState；不持有原模型，非法形状抛 ValueError。
+        """
         layers = tuple(int(layer_id) for layer_id in layer_ids)
         n = int(hasher.max_ngram_size)
         token_map = hasher.token_map.detach().to(device="cpu", dtype=torch.int64, copy=True).contiguous()
@@ -61,23 +70,44 @@ class HashingState:
 
 @dataclass(frozen=True)
 class RequestHasher:
-    """只读 CPU 参数的请求计算器，不持有 tokenizer、模型或请求可变状态。"""
+    """用只读 CPU 参数计算请求行号，不持有 tokenizer、模型或请求可变 history。
+
+    runtime 通过 Hasher Hook 创建并持有至关闭；state 为独立快照，没有后台资源需要 close。
+    每次计算仅创建局部张量，多个调用可并发，前提是调用方不修改 state 内的张量。
+    """
 
     state: HashingState
 
     @classmethod
     def from_hasher(cls, hasher: EngramHasher, *, layer_ids: Sequence[int]) -> RequestHasher:
-        """取得与模型完全相同的词表映射及哈希参数，不构造第二份 tokenizer。"""
+        """创建与模型共用同一组数值参数的 CPU 计算器。
+
+        输入：hasher 为已初始化官方 Hasher，layer_ids 为其 layout 层顺序，cls 为构造计算器的类。
+        输出：持有独立 HashingState 的 RequestHasher，不复制模型或重新构造 tokenizer。
+        """
         return cls(state=HashingState.from_hasher(hasher=hasher, layer_ids=layer_ids))
 
     @property
     def layer_ids(self) -> tuple[int, ...]:
+        """读取哈希输出的层顺序。
+
+        输入：无。
+        输出：不可变层号元组，对应计算结果的 L 维，不复制参数张量。
+        """
         return self.state.layer_ids
 
     def compute_request_row_ids(
         self, token_ids: Sequence[int] | torch.Tensor, start: int, end: int
     ) -> torch.Tensor:
-        """完整请求序列的 [start,end) → CPU int64 [end-start,L,C]，保留段前历史。"""
+        """计算完整请求中 [start,end) 段每个 token 的 Engram 全局行号。
+
+        输入：token_ids 为完整请求的原始 token 序列，可重复；可传 CPU int32／int64 [T] 张量，
+            或整数序列，值须属于 [0,vocab_size)，张量不要求 contiguous。
+            start／end 为绝对位置，满足 0<=start<=end<=T，不是分段后局部位置。
+        输出：CPU int64 [end-start,L,C]，C=(max_ngram_size-1)*n_heads；空段保留 L／C 维。
+        只截取当前段和最多 n-1 个前驱；负的前驱位置通过 blocked 交给官方公式填 pad_id。
+        不修改原始请求或 history；非法区间／token 抛 IndexError，非法张量类型／设备抛 ValueError。
+        """
         if isinstance(token_ids, torch.Tensor):
             if token_ids.device.type != "cpu" or token_ids.ndim != 1:
                 raise ValueError("Engram request token_ids must be a one-dimensional CPU tensor")
@@ -101,6 +131,7 @@ class RequestHasher:
             raise IndexError(f"Engram request token ID outside token_map size {state.token_map.numel()}")
         positions = torch.arange(start, end, dtype=torch.int64, device="cpu")
         shifts = torch.arange(state.max_ngram_size, dtype=torch.int64, device="cpu")
+        # 绝对位置与前驱距离广播为 [end-start,n]；负位置虽暂取第一个 token，随后由 blocked 屏蔽。
         blocked = positions.unsqueeze(-1) < shifts
         source = positions.unsqueeze(-1) - shifts - context_start
         tokens = context[source.clamp_min(0)]

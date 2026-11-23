@@ -1,3 +1,4 @@
+// 同步读取 checkpoint 行字节；类声明在 batch_reader.h，Python 绑定在 bindings.cpp。
 #include "batch_reader.h"
 
 #include <ATen/ops/empty.h>

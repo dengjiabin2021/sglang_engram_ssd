@@ -1,4 +1,5 @@
-// Python 绑定只负责参数转换和 GIL 管理，读取逻辑保留在 BatchRowReader 类中。
+// Python 绑定：接口声明在 batch_reader.h／prefetch_row_pool.h，实现位于各自同名 .cpp。
+// 读取与行池重操作释放 GIL，返回或抛异常时恢复；参数转换与 Tensor 属性返回保留 GIL。
 #include <torch/extension.h>
 #include <pybind11/stl.h>
 
@@ -16,6 +17,7 @@ using sglang_engram_ssd::query::PrefetchRowPool;
 using sglang_engram_ssd::query::PrefetchRowPoolStats;
 using sglang_engram_ssd::query::PrefetchRowResolution;
 
+// 输入为 Python 导入系统提供的 module；副作用是登记 reader／行池及句柄接口，不创建运行资源。
 PYBIND11_MODULE(_C, module) {
   module.doc() = "Engram SSD synchronous row reader and pinned prefetch pool";
 
@@ -23,7 +25,8 @@ PYBIND11_MODULE(_C, module) {
       .def(
           py::init([](const py::sequence& tables,
                       std::int64_t io_uring_queue_depth) {
-            // 这里只在构造时转换一次元数据。访问 Python 属性期间必须持有 GIL。
+            // 输入 tables 为 Python 表元数据序列，深度为该实例正数在途上限；返回独占 reader。
+            // 这里只在构造时转换一次元数据。访问 Python 属性期间必须持有 GIL，FD 始终借用。
             std::vector<RowTableSpec> specs;
             specs.reserve(py::len(tables));
             for (const py::handle table : tables) {
@@ -119,6 +122,7 @@ PYBIND11_MODULE(_C, module) {
           py::kw_only(), py::arg("handle"),
           py::call_guard<py::gil_scoped_release>())
       .def("stats", [](const PrefetchRowPool& pool) {
+        // 输入为借用的 pool，输出为独立 Python 字典；先释放 GIL 取快照，再恢复 GIL 转换结果。
         PrefetchRowPoolStats snapshot;
         {
           py::gil_scoped_release release;

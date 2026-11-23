@@ -136,6 +136,38 @@ def test_lookup_with_no_owned_queries(
         runtime.close()
 
 
+@pytest.mark.parametrize("row_ids", [[5, 6, 5], [0, 0, 1]])
+def test_owner_lookup_does_not_add_current_stream_wait(
+    synthetic_catalog: Callable[..., tuple[EngramSsdCatalog, torch.Tensor, torch.Tensor]],
+    cuda_native_device: torch.device,
+    monkeypatch: pytest.MonkeyPatch,
+    row_ids: list[int],
+) -> None:
+    """A0/A4：owner 结果恢复和空 owner 路径不额外等待当前流；中转区仍由 event 保护。"""
+    catalog, weights, scales = synthetic_catalog(rows=23)
+    runtime = EngramSsdRuntime(
+        catalog=catalog, dim=256, tp_rank=2, tp_size=8,
+        chunk_rows=3, io_uring_queue_depth=4, device=cuda_native_device,
+    )
+
+    def reject_stream_wait(self: torch.cuda.Stream) -> None:
+        raise AssertionError("Owner output restoration must not synchronize the current stream")
+
+    try:
+        indices = torch.tensor([row_ids], dtype=torch.int64, device=cuda_native_device)
+        # 只拦截显式流同步；Event.synchronize 继续保证 pinned/GPU 工作区可安全复用。
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda.Stream, "synchronize", reject_stream_wait)
+            actual = runtime.lookup(layer_id=1, indices=indices)
+        expected = _serial_owner_reference(
+            weights=weights, scales=scales, indices=indices,
+            tp_rank=2, tp_size=8,
+        )
+        assert torch.equal(actual.cpu(), expected)
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize("tp_size", [1, 8])
 def test_lookup_with_empty_queries(
     synthetic_catalog: Callable[..., tuple[EngramSsdCatalog, torch.Tensor, torch.Tensor]],

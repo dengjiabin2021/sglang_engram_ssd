@@ -27,6 +27,13 @@ def init_ssd_embedding(
     dim: int,
     layer_id: int,
 ) -> None:
+    """用 SSD runtime 元数据替代原 Embedding 的整表构造。
+
+    输入：original_fn 为被替换的官方构造函数；self 为尚未初始化的 Embedding；
+        num_embeddings 为全局行数，dim 为行宽 D，layer_id 为当前模型层号。
+    输出：无返回值；初始化 nn.Module，记录本 rank owner 范围并借用共享 runtime，weight／scale 参数设为空。
+    有意不调用 original_fn，防止同时分配完整 DDR 表或 HBM 分片；runtime 负责 reader 和工作区的释放。
+    """
     from torch import nn
 
     from ..runtime import get_engram_ssd_runtime
@@ -59,6 +66,13 @@ def forward_ssd_embedding(
     *,
     cp_all_tokens: bool = False,
 ) -> torch.Tensor:
+    """在原 Engram 消费位置完成本 rank 查询与一次 TP 结果合并。
+
+    输入：original_fn 为官方 forward；self 为 Embedding；indices 为 GPU int32／int64 [T,C] 全局行号，
+        可重复、无需 contiguous，须在表范围内；forward_batch 为可选批元数据；cp_all_tokens 不允许为 True。
+    输出：GPU BF16 [T,C,D] 合并结果；runtime 不存在时完全调用原 forward。
+    纯 prefill 可消费行池，decode／mixed batch 同步读取；所有 rank 须保持模型调用顺序以匹配 TP collective。
+    """
     runtime = getattr(self, "ssd", None)
     if runtime is None:
         return original_fn(self, indices, forward_batch, cp_all_tokens=cp_all_tokens)
@@ -70,6 +84,7 @@ def forward_ssd_embedding(
         runtime.sched_prefetch_enabled and forward_batch is not None
         and forward_batch.forward_mode.is_extend() and not forward_batch.forward_mode.is_mixed()
     ):
+        # 使用真实 GPU Hasher 产出的行号查池，预测未命中仍由 runtime 同步补齐。
         out = runtime.lookup_from_pool(layer_id=self.layer_id, indices=indices)
     else:
         # Decode／mixed batch 不消费此行池，保留同步路径。
@@ -83,6 +98,11 @@ def forward_ssd_embedding(
 def finish_ssd_embedding_load(
     original_fn: Callable[..., Any], self: Any, label: str
 ) -> Any:
+    """在 SSD Embedding 上跳过只适用于完整 DDR backing 的加载完成处理。
+
+    输入：original_fn 为官方 finish_load；self 为 Embedding；label 为原加载阶段标识。
+    输出：SSD 实例返回 None，不执行原 DDR barrier；非 SSD 实例转调原函数并透传其返回值。
+    """
     if getattr(self, "ssd", None) is not None:
         return None  # 没有完整 DDR backing，无需执行其写入完成 barrier。
     return original_fn(self, label)

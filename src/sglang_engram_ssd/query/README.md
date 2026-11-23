@@ -36,7 +36,9 @@ reader.close()
 
 `row_ids` 为连续 CPU int64 全局行号；两个输出是连续 CPU uint8 `[K,D]`、`[K,D/32]`，只写前 Q 行并保留重复与顺序。输入输出不得重叠。
 
-调用同步返回前所有 CQE 已回收，短读、EINTR、完成项错误和未读满均显式处理。读取时释放 GIL；Python 包装保护单个 ring 的串行调用与关闭。reader 借用 runtime 的 FD，close 不关闭 FD。
+调用同步返回前所有 CQE 已回收，短读、EINTR、完成项错误和未读满均显式处理。滑动窗口在完成项到达后补交剩余部分或下一请求，不等待同批最慢请求。出错后停止补交，先收齐在途请求再抛错，保证返回后不再写目标内存。
+
+读取时释放 GIL；Python 包装保护单个 ring 的串行调用与关闭。每个实例独占 ring／锁，借用 runtime 的 FD，close 不关闭 FD。调度预取开启时，runtime 分别创建前台 `reader` 和后台 `prefetch_reader`；各自按配置 queue depth 提交，不共享 reader 锁，但共用磁盘带宽。
 
 返回的 pinned 内存只能在 GPU 已停止读取后复用；runtime 用逐块 CUDA event 保证单套工作区生命周期。
 
@@ -44,7 +46,7 @@ reader.close()
 
 `read_rows_to_slots(layer_id=..., row_ids=..., slot_ids=..., weight_base=..., scale_base=...)`
 将 CPU 连续 int64 `[Q]` 全局行号写入指定的不同槽位，基表为 CPU uint8 `[S,D]`／`[S,D/32]`。
-它复用同一个 ring，释放 GIL 并同步收齐 I/O；文件定位与行步长只由 reader 解释，两个 FD 仍由 runtime 持有。
+同一实例的两种读取方法复用其 ring，释放 GIL 并同步收齐 I/O；runtime 的后台使用独立实例。文件定位与行步长只由 reader 解释，两个 FD 仍由 runtime 持有。
 
 `NativePrefetchRowPool(dim=..., pool_bytes=..., track_stats=False)` 提供：
 

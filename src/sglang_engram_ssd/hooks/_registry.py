@@ -33,6 +33,12 @@ SCHED_PREFETCH_HOOK_TARGETS = (
 
 
 def _check_hook_installation(*, sched_prefetch_enabled: bool = False) -> None:
+    """在模型加载前检查当前功能所需 Hook 是否全部应用成功。
+
+    输入：sched_prefetch_enabled 为是否额外要求调度预取 Hook 组；基础 SSD Hook 始终检查。
+    输出：无返回值、不修改 registry；缺失目标时抛 RuntimeError，阻止以不完整替换组合加载模型。
+    仅在初始化阶段读取官方 registry，不用于运行期间并发修改或重新安装 Hook。
+    """
     # SGLang apply_hooks 会记录并继续处理失败项；模型加载前确认必要 hook 已安装，
     # 防止只安装“跳过权重”却未安装 SSD forward 等不完整组合。
     targets = HOOK_TARGETS + SCHED_PREFETCH_HOOK_TARGETS if sched_prefetch_enabled else HOOK_TARGETS

@@ -24,7 +24,7 @@ python -m pip install --no-deps --no-build-isolation -e ./sglang-engram-ssd
 |---|---|---|
 | `SGLANG_ENABLE_DSV41_ENGRAM_SSD` | `0` | 总开关；关闭时不登记插件 Hook |
 | `SGLANG_DSV41_ENGRAM_SSD_CHUNK_ROWS` | `4096` | 单套同步中转区的行容量，必须为正 |
-| `SGLANG_DSV41_ENGRAM_SSD_IO_URING_QUEUE_DEPTH` | `32` | 在途文件请求数，必须为正；weight、scale 各占一个请求 |
+| `SGLANG_DSV41_ENGRAM_SSD_IO_URING_QUEUE_DEPTH` | `32` | 每个 reader 的在途文件请求上限，必须为正；weight、scale 各占一个请求 |
 | `SGLANG_ENABLE_DSV41_ENGRAM_SSD_DEDUP` | `0` | 对整次本 rank 查询去重，读取唯一行后恢复重复位置 |
 | `SGLANG_ENABLE_DSV41_ENGRAM_SSD_SCHED_PREFETCH` | `0` | 启用 waiting 分段预取、就绪调度和 pinned 行池消费 |
 | `SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_POOL_BYTES` | `2147483648` | 每 rank 行池 payload 预算，必须为正且至少容纳一行 |
@@ -39,7 +39,7 @@ CPU 行号计算直接调用官方 `compute_engram_hash_ids`，参数从模型�
 
 行池保存两张连续 CPU pinned 表，起点均 4096 对齐，容量为 `POOL_BYTES//(D+D/32)`。同一层／行只占一个槽；零引用 READY 槽按 LRU 复用，PENDING 和有引用槽不得覆盖。该预算不包含元数据与对齐余量，不是整个进程 RSS 上限。
 
-调度预取关闭时不解析其数值／策略参数，显式设置只警告并忽略，不创建行池、后台线程或 CPU hash 副本。4096 对齐仅预留后续读取接口，本轮仍从原 checkpoint 正常读取，不包含 O_DIRECT 或合并格式。
+调度预取关闭时不解析其数值／策略参数，显式设置只警告并忽略，不创建行池、后台 reader、后台线程或 CPU hash 副本。4096 对齐仅预留后续读取接口，本轮仍从原 checkpoint 正常读取，不包含 O_DIRECT 或合并格式。
 
 旧版读取选择、查询模式、按层预取、流水和 reader 缓存配置均已退役；显式设置只在启动时警告一次并忽略。配置只由 `config.py` 解析，非法值在原模型加载前拒绝。
 
@@ -47,21 +47,33 @@ CPU 行号计算直接调用官方 `compute_engram_hash_ids`，参数从模型�
 
 ### 调度预取流程
 
-请求成功进入 waiting 队列后，插件保存完整纯文本 token 快照，从匹配 prefix 之后分段；每 rank 只有一个持久后台线程，计算 CPU 行号并向同一个 io_uring reader 提交本 rank 的缺失行。
+请求成功进入 waiting 队列后，插件先登记完整纯文本 token 快照。首次候选筛选时，按当时可见的 prefix 分段并提交。若 batch 满、请求槽不足使原生 raw 调度在筛选前返回，则在返回边界按当前 prefix 为尚未切段的 waiting 请求启动预取，利用其排队期间与当前批计算重叠的窗口。
 
-优先顺序为 chunked 请求下一段、waiting 请求各自首段，再补后续段；每个请求最多占有当前段与下一段。池满立即停止占槽，在后续调度中重试，不让 scheduler 等待 I/O。
+原生优先级策略不一定在这一阶段匹配前缀，提前返回时 prefix 也可能仍为零，因此仍可能重复读取部分已缓存前缀。插件不主动修改 KV 缓存的前缀状态；forward 始终按真实行号消费和补读。
+
+每 rank 只有一个持久后台线程，使用独立 `prefetch_reader` 读取本 rank 的缺失行；forward 的 `reader` 使用另一套 ring／锁，两者共用 runtime 持有的只读 FD。每套 ring 在请求完成后持续补交，按各自配置的队列深度限制在途数量，最多合计两套在途队列。独立 ring 消除前后台锁等待，实际仍竞争 SSD 带宽。
+
+优先顺序为 chunked 请求下一段、waiting 请求各自首段，再补后续段；每个请求最多占有当前段与下一段。池满后缓存段行号，等请求或 GPU 引用释放后再尝试占槽，不在每次调度中重复计算 hash，不让 scheduler 等待 I/O。
 
 | 策略 | 放行规则 |
 |---|---|
 | `best_effort` | 全部放行，未就绪数据在 forward 补读 |
-| `wait_complete` | 下一段在全部 TP rank READY 才放行 |
+| `wait_complete` | 下一 chunk 覆盖的全部段在所有 TP rank READY 才放行 |
 | `timeout` | 全部 rank 各自满足 READY 或提交后超时即可放行 |
 
-整批候选只通过一次 CPU gloo `all_reduce(MIN)` 得到一致结果，空候选不通信。未登记、池满或实际 prefix 比原计划更早的未覆盖请求，按入队 deadline 防止饿死；非 timeout 策略使用默认 500ms，不解析显式 TIMEOUT_MS。chunked continuation 不经过 waiting 筛选。
+覆盖范围按下一 chunk 的 token 上界检查，原生调度仍可按剩余预算缩短它。未登记、池满、两段上限不足以覆盖 chunk 或实际 prefix 比原计划更早时，按入队 deadline 防止饿死；非 timeout 策略使用默认 500ms，不解析显式 TIMEOUT_MS。chunked continuation 不经过 waiting 筛选。
+
+未启用 chunked prefill 时，覆盖范围是整个剩余 prompt。若其长度超过两段容量，`wait_complete` 也会在入队 deadline 后放行并同步补读，**不保证等待全部预取完成**；保留该行为以避免两段资源上限导致永久等待。
 
 原生 raw 调度会在内部加入 grammar-ready 请求并排序，因此新增 priority AFTER Hook 在该阶段结束后统一过滤；外层 AROUND 在返回时恢复暂缓请求及期间新入队项。run_batch AFTER 保存不可变 forward_iter／token 区间／generation，结果处理 AFTER 按此对账，避免 overlap 与 retract 的可变 Req 字段造成错误释放。
 
-后台异常在下一次调度或 forward 主路径抛出；后台不发 TP collective。abort、完成和 retract 释放请求引用；已提交 I/O 完成后才回收槽位。关闭顺序为停止提交、收齐后台、收齐 GPU 临时引用、关闭行池、reader、FD。
+每次 raw 调度最多一次 CPU gloo `all_reduce(MIN)`：有候选时，将独立失败标志与整个候选放行向量一起归约；有 waiting／chunked 请求但 raw 提前返回时，仅归约失败标志。waiting 为空且没有 `chunked_req` 时跳过归约和第二次对账，纯 decode 不增加该 CPU 通信。原生 raw 仍正常执行，内部新加入的 grammar-ready 请求也会触发预取和同步。
+
+是否通信只依赖原生 waiting／chunked 状态，不依赖本地 `states`、后台任务或失败标志；本地后台失败后 `states` 可能与健康 rank 不同。失败标志为 `-1` 时归约后各 rank 统一报错，本 rank 保留原始异常原因。
+
+forward 不检查后台失败，READY 行照常消费、缺失行通过独立 reader 补读。无 prefill 需求期间保留后台错误，下一次 waiting／chunked 需求进入 raw 调度时统一传播。前台 I/O／CUDA 错误仍直接传播，该机制不处理任意进程退出或调度流程分歧。仅有 chunked 请求、候选为空时仍做一次失败归约，不新增配置或第二次归约。
+
+后台不发 TP collective。abort、完成和 retract 释放请求引用；已提交 I/O 完成后才回收槽位。关闭顺序为停止提交、收齐后台、收齐 GPU 临时引用、关闭行池、两个 reader、FD。
 
 ### 服务命令
 
@@ -99,7 +111,8 @@ resolve 的临时引用独立于请求段引用，GPU gather 完成事件未就�
 ```bash
 cd /workspace/sglang_engram_ssd
 python -m pytest -q tests/test_config.py tests/test_registration.py tests/test_hashing.py \
-  tests/test_prefetch_row_pool.py tests/test_sched_prefetch.py tests/test_runtime.py tests/test_pool_lookup.py
+  tests/test_io_uring_reader.py tests/test_prefetch_row_pool.py tests/test_sched_prefetch.py \
+  tests/test_runtime.py tests/test_pool_lookup.py
 torchrun --standalone --nproc-per-node=8 -m pytest -q tests/test_distributed.py
 ```
 

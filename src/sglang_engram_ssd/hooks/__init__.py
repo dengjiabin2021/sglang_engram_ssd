@@ -5,8 +5,8 @@ from __future__ import annotations
 from ..config import should_register_sched_prefetch_hooks
 from ._registry import HOOK_TARGETS
 
-# 保留原 hooks.py 的登记顺序：模型加载、权重加载、embedding。
-# 根包 register() 仍只需导入 hooks，各子模块均在插件来源上下文内加载。
+# 先登记模型／权重加载，再登记 embedding；模型加载时会统一检查这些目标均已成功替换。
+# 根包 register() 只需导入本包，各子模块的装饰器均在插件来源上下文内执行。
 from .model_loading import (
     load_model_with_engram_ssd,
     require_default_model_loader,
@@ -33,6 +33,7 @@ __all__ = [
 ]
 
 if should_register_sched_prefetch_hooks():
+    # 开关关闭不导入新 Hook，避免仅导入插件就捕获 hash 参数或创建调度资源。
     from .engram_hasher import capture_request_hasher
     from .scheduler import (
         filter_engram_candidates,

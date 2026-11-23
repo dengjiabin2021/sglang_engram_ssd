@@ -40,11 +40,19 @@ def load_model_with_engram_ssd(
     memory_saver_adapter: Any,
     is_draft_worker: bool,
 ) -> Any:
+    """在原模型加载前校验支持范围、原生 reader 与 checkpoint 大表目录。
+
+    输入：original_fn 为官方加载入口；model_config／load_config 为原模型和加载配置；device 为设备类型；
+        gpu_id 为原加载器的 GPU 标识；memory_saver_adapter 为原内存适配器；is_draft_worker 必须为 False。
+    输出：完成校验并安装 catalog 后调用 original_fn，返回原 LoadedModel；不在 Hook 中加载大表 payload。
+    配置和模型限制不符时立即抛异常；初始化探测 ring 自行关闭，catalog 留给当前 worker 的 runtime 借用。
+    """
     # 必须先在模型加载调用链内校验；此处异常不再经过插件注册的捕获逻辑。
     config = get_config()
     _check_hook_installation(sched_prefetch_enabled=config.sched_prefetch_enabled)
     from ..query.native import validate_native_reader
 
+    # 先验证必需扩展和 ring 能初始化，防止耗时权重加载完成后才暴露读取依赖错误。
     validate_native_reader(io_uring_queue_depth=config.io_uring_queue_depth)
 
     # 本 Hook 由独立的 SSD 开关启用，不读取原 HOST_TABLE 开关或 DDR 布局。
@@ -131,6 +139,12 @@ def require_default_model_loader(
     load_config: LoadConfig,
     model_config: Optional[ModelConfig] = None,
 ) -> BaseModelLoader:
+    """保留原 loader 选择过程，并拒绝未支持的实际 loader 类型。
+
+    输入：original_fn 为官方 get_model_loader；load_config 为加载配置；model_config 为可选模型配置。
+    输出：原函数创建的 DefaultModelLoader 对象，生命周期仍由 SGLang 管理；其他类型抛 ValueError。
+    不用配置名推断具体 loader，因为量化配置也可能改变原函数的选择结果。
+    """
     from sglang.srt.model_loader.loader import DefaultModelLoader
 
     loader = original_fn(load_config=load_config, model_config=model_config)

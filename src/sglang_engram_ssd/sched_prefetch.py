@@ -165,6 +165,8 @@ class SchedulerPrefetchController:
         # GPU／TP8 合成调度器只提供 chunk 大小，此时它也是唯一预算。
         max_prefill_tokens = getattr(scheduler, "max_prefill_tokens", self.chunked_tokens)
         self.prefill_tokens = min(self.chunked_tokens or max_prefill_tokens, max_prefill_tokens)
+        # 原生 PrefillAdder 按页向上取整扣预算、按页对齐截断；合成调度器没有页时按 1 处理。
+        self.page_size = getattr(scheduler, "page_size", 1) or 1
         self.cpu_group = scheduler.tp_group.cpu_group  # 借用已有 gloo 组，不在后台建立通信组。
         self.states: dict[int, RequestPrefetchState] = {}  # id(req) -> 状态；值持有 Req 强引用。
         self._condition = threading.Condition()  # 保护任务队列、失败标志、段状态和统计；锁内不做 I/O。
@@ -880,21 +882,32 @@ class SchedulerPrefetchController:
         except BaseException as error:
             self._stop_failed(error=error)
 
-    def _request_slots(self, *, scheduler: Any, running_batch: Any) -> int:
-        """估算每一预测批最多放几个请求。
+    def _request_slots(self, *, scheduler: Any, running_batch: Any) -> tuple[int, int]:
+        """估算预测的第 1 批和之后每批最多放几个请求。
 
-        输入：scheduler 提供运行中请求上限；running_batch 保留原签名，不参与估算。
-        输出：max_running_requests。运行中请求往往成批结束，下一批可能一次放满；
-            真正限制每批大小的是 token 预算，按当前空槽估算会只预取队首一两个请求。
+        输入：scheduler 提供运行中请求上限和原生空闲名额；running_batch 为当前运行批，可为 None。
+        输出：(第 1 批, 之后每批)。第 1 批用原生 get_num_allocatable_reqs 的空闲名额；
+            空闲为 0（运行批满）时下一批要等请求结束，这时和之后各批一样按上限估算，
+            因为运行中请求往往成批结束，下一批可能一次放满。
         """
-        return scheduler.max_running_requests
+        limit = scheduler.max_running_requests
+        if running_batch is None:
+            return limit, limit
+        free = scheduler.get_num_allocatable_reqs(len(running_batch.reqs), running_batch=running_batch)
+        return (free if free > 0 else limit), limit
 
-    def _plan_window(self, *, waiting: Sequence[Any], chunked: Any, slots: int, batches: int) -> _Window:
+    def _plan_window(
+        self, *, waiting: Sequence[Any], chunked: Any, slots: int, batches: int, first_slots: int | None = None,
+    ) -> _Window:
         """按原生队列顺序推算未来 prefill 批次，保留截断请求的首位。
 
-        输入：waiting 为排序后的原生请求，chunked 为延续请求或 None；slots/batches 限制每批请求数和批数。
+        输入：waiting 为排序后的原生请求，chunked 为延续请求或 None；slots/batches 限制每批请求数和批数，
+            first_slots 为第 1 批的请求数上限，None 时同 slots。
         输出：(请求, start, end, 批次序号) 列表；依当前 prefix 估算，无副作用。
+        与原生 PrefillAdder 一致：每个区间按页向上取整扣预算；放不下整段时截断长度按页向下取整，
+            终点再对齐到页边界，截断长度为 0 时本批结束。
         """
+        page = self.page_size
         requests = chain((chunked,) if chunked is not None else (), waiting)
         spans = (
             (req, req.prefix_len, len(req.origin_input_ids) + len(req.output_ids))
@@ -904,18 +917,26 @@ class SchedulerPrefetchController:
         window = []
         for batch in range(1, batches + 1):
             budget = self.prefill_tokens
-            for _ in range(slots):
+            for _ in range(first_slots if batch == 1 and first_slots is not None else slots):
                 while current is not None and current[1] >= current[2]:
                     current = next(spans, None)
                 if current is None:
                     return window
                 req, start, stop = current
-                # 不启用分块时保留完整请求；原生允许首个请求独占一批并超出 token 预算。
-                if not self.chunked_tokens and budget < self.prefill_tokens and stop - start > budget:
-                    break
-                end = min(stop, start + budget) if self.chunked_tokens else stop
+                if not self.chunked_tokens:
+                    # 不启用分块时保留完整请求；原生允许首个请求独占一批并超出 token 预算。
+                    if budget < self.prefill_tokens and stop - start > budget:
+                        break
+                    end = stop
+                elif -(-(stop - start) // page) * page <= budget:
+                    end = stop
+                else:
+                    # schedule_policy.py _select_prefill_admission 的截断：长度按页取整，终点对齐页边界。
+                    end = (start + budget // page * page) // page * page
+                    if end <= start:
+                        break
                 window.append((req, start, end, batch))
-                budget -= end - start
+                budget -= -(-(end - start) // page) * page
                 current = (req, end, stop) if end < stop else next(spans, None)
                 if budget <= 0:
                     break
@@ -946,10 +967,9 @@ class SchedulerPrefetchController:
                 self._discard_state(state=state)
         skip = 1 if forming else 0  # 正在组的批占预测的第 1 批
         batches = self.config.window_batches + skip
+        first_slots, slots = self._request_slots(scheduler=scheduler, running_batch=running_batch)
         window = self._plan_window(
-            waiting=waiting, chunked=chunked,
-            slots=self._request_slots(scheduler=scheduler, running_batch=running_batch),
-            batches=batches,
+            waiting=waiting, chunked=chunked, slots=slots, batches=batches, first_slots=first_slots,
         )
         planned: dict[int, dict[tuple[int, int], Priority]] = {}
         current: dict[int, set[tuple[int, int]]] = {}  # 正在组的批：已有同区间段保留，不新建

@@ -232,6 +232,9 @@ def environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[Environment]:
         waiting_queue=[], chunked_req=None, chunked_prefill_size=2, max_running_requests=128,
         max_prefill_tokens=128, tp_group=SimpleNamespace(cpu_group=object()),
     )
+    scheduler.get_num_allocatable_reqs = lambda running_bs, running_batch=None: (
+        scheduler.max_running_requests - running_bs
+    )
     manager = sched_prefetch.SchedulerPrefetchController(runtime=runtime, scheduler=scheduler)
     try:
         yield manager, runtime, scheduler, config
@@ -372,7 +375,7 @@ def test_window_cancels_moved_segments_and_reuses_ready_cache(environment: Envir
 
 
 def test_window_places_continuation_first_and_respects_request_slots(environment: Environment) -> None:
-    """完成标准 2：已有续段优先；新截断区间在下一批最前；每批请求数按运行上限估算，不扣除运行中请求。"""
+    """完成标准 2：已有续段优先；新截断区间在下一批最前；第 1 批按原生空闲名额，运行批满时按上限估算。"""
     manager, _, scheduler, _ = environment
     manager.chunked_tokens = manager.prefill_tokens = 5
     chunked = scheduler.chunked_req = _request("chunked", [0, 1, 2, 3], prefix=2)
@@ -384,12 +387,18 @@ def test_window_places_continuation_first_and_respects_request_slots(environment
     assert manager._plan_window(waiting=waiting, chunked=chunked, slots=1, batches=2) == [
         (chunked, 2, 4, 1), (first, 0, 4, 2),
     ]
-    # 运行批满时仍按上限估算：请求常成批结束，下一批可能一次放满。
+    # 第 1 批只剩 1 个空闲名额：只放续段，之后各批按上限。
+    assert manager._plan_window(waiting=waiting, chunked=chunked, slots=2, batches=2, first_slots=1) == [
+        (chunked, 2, 4, 1), (first, 0, 4, 2), (second, 0, 1, 2),
+    ]
     scheduler.max_running_requests = 3
-    running = SimpleNamespace(reqs=[object(), object(), object()])
-    slots = manager._request_slots(scheduler=scheduler, running_batch=running)
-    assert slots == 3
-    assert manager._plan_window(waiting=waiting, chunked=chunked, slots=slots, batches=2) == expected
+    scheduler.get_num_allocatable_reqs = lambda running_bs, running_batch=None: 3 - running_bs
+    # 运行批满时仍按上限估算：请求常成批结束，下一批可能一次放满。
+    full = SimpleNamespace(reqs=[object(), object(), object()])
+    assert manager._request_slots(scheduler=scheduler, running_batch=full) == (3, 3)
+    one = SimpleNamespace(reqs=[object(), object()])
+    assert manager._request_slots(scheduler=scheduler, running_batch=one) == (1, 3)
+    assert manager._request_slots(scheduler=scheduler, running_batch=None) == (3, 3)
 
 
 def test_window_caps_chunk_with_max_prefill_tokens(environment: Environment) -> None:
@@ -409,26 +418,29 @@ def test_window_caps_chunk_with_max_prefill_tokens(environment: Environment) -> 
 
 
 @pytest.mark.parametrize(
-    ("lengths", "continuation", "slots"),
+    ("lengths", "continuation", "slots", "page"),
     [
-        pytest.param([3, 7, 2], None, 8, id="shared-chunk"),
-        pytest.param([2, 4], (7, 3), 8, id="continuation-first"),
-        pytest.param([2, 2, 2], None, 2, id="request-limit"),
+        pytest.param([3, 7, 2], None, 8, 1, id="shared-chunk"),
+        pytest.param([2, 4], (7, 3), 8, 1, id="continuation-first"),
+        pytest.param([2, 2, 2], None, 2, 1, id="request-limit"),
+        pytest.param([3, 7, 2], None, 8, 4, id="paged-chunk"),
+        pytest.param([5, 6], None, 8, 4, id="paged-no-room"),
     ],
 )
 def test_first_window_batch_matches_native_adder(
     environment: Environment, monkeypatch: pytest.MonkeyPatch,
-    lengths: list[int], continuation: tuple[int, int] | None, slots: int,
+    lengths: list[int], continuation: tuple[int, int] | None, slots: int, page: int,
 ) -> None:
-    """完成标准 3：按 lengths、续段（总长、前缀）和 slots 用真实 PrefillAdder 对照批 1。"""
+    """完成标准 3：按 lengths、续段（总长、前缀）、slots 和页大小用真实 PrefillAdder 对照批 1。"""
     policy = pytest.importorskip("sglang.srt.managers.schedule_policy")
     from sglang.srt.mem_cache.prefill_budget import PrefillBudget
     from sglang.srt.sampling.sampling_params import SamplingParams
 
     manager, _, _, _ = environment
     manager.chunked_tokens = manager.prefill_tokens = 8
+    manager.page_size = page
     # 用真实的 token 预算，替身只提供充足的 KV 容量、空 cache 与前缀锁接口。
-    allocator = SimpleNamespace(page_size=1, available_size=lambda: 1024, request_slot_reserve=lambda **_: 0)
+    allocator = SimpleNamespace(page_size=page, available_size=lambda: 1024, request_slot_reserve=lambda **_: 0)
     allocator.create_prefill_budget = partial(PrefillBudget, allocator)
     cache = SimpleNamespace(
         supports_mamba=lambda: False, evictable_size=lambda: 0, lock=lambda _: None, unlock=lambda _: None,
@@ -437,7 +449,7 @@ def test_first_window_batch_matches_native_adder(
     exec_config = SimpleNamespace(features=SimpleNamespace(enable_encoder_swa_bounded_replay=False))
     monkeypatch.setattr(policy, "get_exec", lambda: exec_config)
     adder = policy.PrefillAdder(
-        page_size=1, tree_cache=cache, token_to_kv_pool_allocator=allocator, running_batch=None,
+        page_size=page, tree_cache=cache, token_to_kv_pool_allocator=allocator, running_batch=None,
         new_token_ratio=1.0, rem_input_tokens=8, rem_chunk_tokens=8, prefill_max_requests=slots,
     )
 

@@ -109,6 +109,8 @@ def main():
         print("\n预取隐藏比例（(同步SSD - 预取) / (同步SSD - DDR)）")
         for label, key in (("TPOT p50", "client_tpot_p50_ms"), ("TTFT p50", "client_ttft_p50_ms")):
             ddr, sync, prefetch = (reports[m]["summary"][key] for m in ("ddr", "sync", "prefetch"))
+            if None in (ddr, sync, prefetch):
+                continue  # 只输出 1 个 token 的负载没有 TPOT
             gap = sync - ddr
             print(f"{label:<24}{fmt((sync - prefetch) / gap * 100 if abs(gap) > 1e-6 else None):>13}%")
 

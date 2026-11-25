@@ -93,12 +93,12 @@ class NativeBatchRowReader:
         self, *, layer_id: int, row_ids: torch.Tensor, slot_ids: torch.Tensor,
         weight_base: torch.Tensor, scale_base: torch.Tensor,
     ) -> None:
-        """同步把缺失行写进调用方预留的 PENDING 池槽。
+        """同步把缺失行写进预留的 PENDING 池槽或调用方的 batch 暂存区。
 
         输入：layer_id 为已登记层；row_ids 为连续 CPU int64 [Q] 全局行号，可重复，范围 [0,rows)。
             slot_ids 为等长连续 CPU int64 [Q]，互不重复且属于 [0,S)。
             weight_base／scale_base 为连续 CPU uint8 [S,D]／[S,D/32]，指定槽不得被 GPU 使用。
-        输出：仅写指定槽的数据，不发布 READY；调用方在成功返回后 mark_ready，失败先收齐 I/O 再抛错。
+        输出：仅写指定槽的数据；对池槽由调用方在成功返回后 mark_ready，失败先收齐 I/O 再抛错。
         """
         with self._lock:
             self._reader.read_rows_to_slots(
@@ -193,10 +193,36 @@ class NativePrefetchRowPool:
         """为一批全局行登记段引用，不执行 I/O。
 
         输入：layer_id 非负；row_ids 为连续 CPU int64 [Q]，行号非负，可重复；上限由 reader 校验。
-        输出：句柄包含去重后的槽引用及 missing_row_ids／missing_slot_ids；池满返回 None 且状态不变。
+        输出：句柄的 row_ids／slot_ids 为去重后对齐的 CPU int64 [U]。
+            missing_row_ids／missing_slot_ids 只记录新建槽；池满返回 None 且状态不变。
         调用方读取缺失行并发布 READY，最终 release／cancel；失败槽或非法输入直接抛错。
         """
         return self._pool.acquire(layer_id=layer_id, row_ids=row_ids)
+
+    def available_slots(self) -> int:
+        """查询当前可分配容量。
+
+        输入：无；池须开放。输出：空闲槽与零引用 READY 槽之和，不占槽或读盘。
+        """
+        return self._pool.available_slots()
+
+    def slots_needed(self, *, layer_id: int, row_ids: torch.Tensor, limit: int = -1) -> int:
+        """估算这批行占用多少可用槽。
+
+        输入：非负 layer_id 与连续 CPU int64 [Q] 非负全局行号，可重复。
+            limit 为非负数时，计数超过它即可结束；默认 -1 统计全部行。
+        输出：去重后尚无槽或位于 LRU 的行数，不增加槽引用。
+        """
+        return self._pool.slots_needed(layer_id=layer_id, row_ids=row_ids, limit=limit)
+
+    def pending_slots(self, *, layer_id: int, row_ids: torch.Tensor) -> torch.Tensor:
+        """查询指定行当前的 PENDING 槽号。
+
+        输入：非负 layer_id 与连续 CPU int64 [Q] 非负全局行号，可重复。
+        输出：与输入对齐的连续 CPU int64 [Q] 槽号，非 PENDING 为 -1，失败槽抛错。
+        调用方负责保留槽引用和串行化读取；查询不做 I/O 或增加引用。
+        """
+        return self._pool.pending_slots(layer_id=layer_id, row_ids=row_ids)
 
     def is_ready(self, *, handle: Any) -> bool:
         """非阻塞检查句柄持有的槽是否全部 READY。
@@ -214,13 +240,15 @@ class NativePrefetchRowPool:
         """
         self._pool.mark_ready(slot_ids=slot_ids)
 
-    def release(self, *, handle: Any) -> None:
-        """归还句柄引用，不取消在途 I/O。
+    def release(self, *, handle: Any, discard_pending: bool = False) -> None:
+        """归还句柄引用，可回收确定无人读取的槽。
 
-        输入：本池 handle；GPU 临时引用须在对应 CUDA event 完成后归还。
-        输出：各槽引用减一，无引用 READY 进入 LRU；PENDING 保留，重复归还无效果。
+        输入：本池 handle；组装引用在 READY 槽复制完后归还。
+            普通段撤销时可设 discard_pending，且在途写入须由存活的引用保护。
+        输出：各槽引用减一；归零的 READY 进入 LRU，归零的 PENDING 在 discard_pending 为真时回收。
+        共享 PENDING 仍可继续读取，重复归还无效果。
         """
-        self._pool.release(handle=handle)
+        self._pool.release(handle=handle, discard_pending=discard_pending)
 
     def cancel(self, *, handle: Any) -> None:
         """归还句柄并撤销其新建、未发布的槽。
@@ -231,11 +259,11 @@ class NativePrefetchRowPool:
         self._pool.cancel(handle=handle)
 
     def resolve(self, *, layer_id: int, row_ids: torch.Tensor) -> PoolResolution:
-        """解析 forward 行号，临时固定所有 READY 命中槽。
+        """在组装 batch 前临时固定所有 READY 命中槽。
 
         输入：layer_id 非负；row_ids 为连续 CPU int64 [Q] 非负全局行号，可重复。
         输出：CPU int64 [Q] 槽号、CPU bool [Q] 命中掩码及独立句柄，保留查询位置；PENDING 不命中。
-        每个命中槽只加一次引用；GPU gather 完成后调用方必须 release，不能只丢弃返回对象。
+        每个命中槽只加一次引用；把槽的数据复制到暂存区后，调用方必须 release。
         """
         resolution = self._pool.resolve(layer_id=layer_id, row_ids=row_ids)
         return PoolResolution(
@@ -251,10 +279,10 @@ class NativePrefetchRowPool:
         return self._pool.stats()
 
     def record_forward(self, *, hits: int, misses: int, miss_ms: float) -> None:
-        """登记一次 forward 的查询位置和同步补读耗时。
+        """登记批次组装的查询位置和同步补读耗时。
 
         输入：hits／misses 为非负位置数，含重复查询；miss_ms 为非负有限毫秒数。
-        输出：开启统计时累加对应计数，否则不累加；补读时间由调用方定义，不是纯 SSD 时间。
+        输出：开启统计时累加对应计数；耗时包含前台 reader 等待和主存组装。
         """
         self._pool.record_forward(hits=hits, misses=misses, miss_ms=miss_ms)
 

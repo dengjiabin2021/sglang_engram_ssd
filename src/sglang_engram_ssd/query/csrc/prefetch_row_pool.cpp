@@ -126,6 +126,14 @@ at::Tensor PrefetchRowHandle::missing_slot_ids() const {
   return missing_slot_ids_;
 }
 
+at::Tensor PrefetchRowHandle::row_ids() const {
+  return row_ids_;
+}
+
+at::Tensor PrefetchRowHandle::slot_ids() const {
+  return slot_ids_;
+}
+
 PrefetchRowPool::PrefetchRowPool(std::int64_t dim, std::int64_t pool_bytes, bool track_stats)
     : capacity_(pool_capacity(dim, pool_bytes)),
       weight_stride_(dim),
@@ -236,6 +244,10 @@ void PrefetchRowPool::add_lru(std::int64_t slot_id) {
 
 void PrefetchRowPool::pin(std::int64_t slot_id) {
   auto& slot = slots_[slot_id];
+  // acquire 也能复用 PENDING；只有发布后的命中才计为使用。
+  if (track_stats_ && slot.state == State::READY) {
+    slot.used = true;
+  }
   if (slot.references == 0) {
     if (slot.state == State::READY) {
       remove_lru(slot_id);
@@ -245,7 +257,7 @@ void PrefetchRowPool::pin(std::int64_t slot_id) {
   ++slot.references;
 }
 
-// 回收一个无引用的槽：READY 槽此时一定在 LRU 中，需要先摘除；PENDING 槽只会是被撤销的失败槽。
+// 回收一个无引用的槽：READY 先从 LRU 摘除；PENDING 已取消且没有在途 I/O。
 void PrefetchRowPool::recycle(std::int64_t slot_id) {
   auto& slot = slots_[slot_id];
   if (slot.state == State::READY) {
@@ -261,16 +273,15 @@ void PrefetchRowPool::recycle(std::int64_t slot_id) {
   ++free_slots_;
 }
 
-void PrefetchRowPool::unpin(std::int64_t slot_id) {
+void PrefetchRowPool::unpin(std::int64_t slot_id, bool discard_pending) {
   auto& slot = slots_[slot_id];
   --slot.references;
   if (slot.references == 0) {
     --referenced_slots_;
-    // READY 进入 LRU 留作缓存；失败槽不能再被使用，直接回收。
-    // 正常 PENDING 不动：I/O 可能还在写，等 mark_ready 再进 LRU。
+    // READY 进入 LRU；PENDING 只有确认无在途写入时才可归还空闲链表。
     if (slot.state == State::READY) {
       add_lru(slot_id);
-    } else if (slot.failed) {
+    } else if (slot.failed || discard_pending) {
       recycle(slot_id);
     }
   }
@@ -279,6 +290,11 @@ void PrefetchRowPool::unpin(std::int64_t slot_id) {
 std::int64_t PrefetchRowPool::take_slot() {
   // 调用方已检查过 free_slots_ + 可回收的 LRU 槽足够，所以这里 lru_tail_ 一定有效。
   if (free_head_ < 0) {
+    if (track_stats_) {
+      // LRU 只含零引用 READY 槽，在回收清空元数据前统计此次淘汰。
+      ++counters_.evicted_slots;
+      counters_.evicted_unused_slots += !slots_[lru_tail_].used;
+    }
     recycle(lru_tail_);
   }
   const auto slot_id = free_head_;
@@ -288,9 +304,9 @@ std::int64_t PrefetchRowPool::take_slot() {
   return slot_id;
 }
 
-void PrefetchRowPool::release_slots(PrefetchRowHandle& handle) {
+void PrefetchRowPool::release_slots(PrefetchRowHandle& handle, bool discard_pending) {
   for (const auto slot_id : handle.slots_) {
-    unpin(slot_id);
+    unpin(slot_id, discard_pending);
   }
   handle.released_ = true;
 }
@@ -302,27 +318,28 @@ std::shared_ptr<PrefetchRowHandle> PrefetchRowPool::acquire(
   std::lock_guard lock(mutex_);
   require_open();
   // 第一步：把输入行分成"池中已有"和"需要新建"两类，此时不修改任何状态。
-  std::vector<std::int64_t> existing;
+  std::vector<std::int64_t> existing(rows.size(), -1);
   std::vector<std::int64_t> missing;
-  existing.reserve(rows.size());
   missing.reserve(rows.size());
   std::int64_t protected_cached = 0;
-  for (const auto row : rows) {
-    const auto found = index_.find(RowKey{layer_id, row});
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    const auto found = index_.find(RowKey{layer_id, rows[i]});
     if (found == index_.end()) {
-      missing.push_back(row);
+      missing.push_back(rows[i]);
     } else {
       const auto slot_id = found->second;
       require_healthy(slots_[slot_id]);
-      existing.push_back(slot_id);
+      existing[i] = slot_id;
       if (slots_[slot_id].state == State::READY && slots_[slot_id].references == 0) {
         ++protected_cached;
       }
     }
   }
   // 第二步：检查空间。可用槽 = 空闲槽 + LRU 中的缓存槽，但本次要复用的缓存槽稍后会被 pin，
-  // 不能算作可回收空间。空间不足时直接返回，池状态保持不变。
-  if (static_cast<std::int64_t>(missing.size()) > free_slots_ + cached_slots_ - protected_cached) {
+  // 不能算作可回收空间。
+  const auto available = free_slots_ + cached_slots_ - protected_cached;
+  const auto absent = static_cast<std::int64_t>(missing.size());
+  if (absent > available) {
     return nullptr;
   }
   auto handle = std::shared_ptr<PrefetchRowHandle>(new PrefetchRowHandle(shared_from_this()));
@@ -331,25 +348,35 @@ std::shared_ptr<PrefetchRowHandle> PrefetchRowPool::acquire(
   handle->missing_row_ids_ = cpu_ids(missing);
   handle->missing_slot_ids_ = at::empty(
       {static_cast<std::int64_t>(missing.size())}, at::TensorOptions().device(at::kCPU).dtype(at::kLong));
+  handle->row_ids_ = cpu_ids(rows);
+  handle->slot_ids_ = cpu_ids(existing);
+  auto* slot_ids = handle->slot_ids_.data_ptr<std::int64_t>();
   auto* missing_slots = handle->missing_slot_ids_.data_ptr<std::int64_t>();
   try {
     // 第三步：先 pin 全部已有行，使它们离开 LRU；再为新行取槽，
     // 这样 take_slot 回收 LRU 尾部时不会淘汰本次要复用的行。
     for (const auto slot_id : existing) {
-      pin(slot_id);
-      handle->slots_.push_back(slot_id);
+      if (slot_id >= 0) {
+        pin(slot_id);
+        handle->slots_.push_back(slot_id);
+      }
     }
-    for (std::size_t i = 0; i < missing.size(); ++i) {
+    std::size_t next = 0;
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+      if (existing[i] >= 0) {
+        continue;
+      }
       const auto slot_id = take_slot();
       auto& slot = slots_[slot_id];
-      slot.key = RowKey{layer_id, missing[i]};
+      slot.key = RowKey{layer_id, rows[i]};
       slot.state = State::PENDING;
       slot.references = 1;
       ++referenced_slots_;
       ++pending_slots_;
       handle->slots_.push_back(slot_id);
       handle->created_slots_.push_back(slot_id);
-      missing_slots[i] = slot_id;
+      slot_ids[i] = slot_id;
+      missing_slots[next++] = slot_id;
       index_.emplace(slot.key, slot_id);
     }
   } catch (...) {
@@ -362,9 +389,55 @@ std::shared_ptr<PrefetchRowHandle> PrefetchRowPool::acquire(
   }
   if (track_stats_) {
     // 统计"本次无需新读"的行数（批内重复 + 池中已有）；实际提交读取的行数由调用方 record_submitted。
-    counters_.dedup_saved_rows += row_ids.numel() - static_cast<std::int64_t>(missing.size());
+    counters_.dedup_saved_rows += row_ids.numel() - absent;
   }
   return handle;
+}
+
+std::int64_t PrefetchRowPool::available_slots() const {
+  std::lock_guard lock(mutex_);
+  require_open();
+  return free_slots_ + cached_slots_;
+}
+
+std::int64_t PrefetchRowPool::slots_needed(
+    std::int64_t layer_id, const at::Tensor& row_ids, std::int64_t limit) const {
+  check_rows(layer_id, row_ids);
+  const auto* rows = row_ids.data_ptr<std::int64_t>();
+  std::unordered_set<std::int64_t> seen;
+  std::lock_guard lock(mutex_);
+  require_open();
+  std::int64_t needed = 0;
+  for (std::int64_t i = 0; i < row_ids.numel(); ++i) {
+    const auto found = index_.find(RowKey{layer_id, rows[i]});
+    // 本段也需要的 LRU 槽必须保留，与尚无槽的行一样占用可用空间。
+    const bool needs_slot = found == index_.end() ||
+        (slots_[found->second].state == State::READY && slots_[found->second].references == 0);
+    if (needs_slot && seen.insert(rows[i]).second) {
+      ++needed;
+      if (limit >= 0 && needed > limit) {
+        break;
+      }
+    }
+  }
+  return needed;
+}
+
+at::Tensor PrefetchRowPool::pending_slots(std::int64_t layer_id, const at::Tensor& row_ids) const {
+  check_rows(layer_id, row_ids);
+  auto result = at::full({row_ids.numel()}, -1, at::TensorOptions().device(at::kCPU).dtype(at::kLong));
+  const auto* rows = row_ids.data_ptr<std::int64_t>();
+  auto* result_ids = result.data_ptr<std::int64_t>();
+  std::lock_guard lock(mutex_);
+  require_open();
+  for (std::int64_t i = 0; i < row_ids.numel(); ++i) {
+    const auto found = index_.find(RowKey{layer_id, rows[i]});
+    if (found != index_.end() && slots_[found->second].state == State::PENDING) {
+      require_healthy(slots_[found->second]);
+      result_ids[i] = found->second;
+    }
+  }
+  return result;
 }
 
 bool PrefetchRowPool::is_ready(const std::shared_ptr<PrefetchRowHandle>& handle) const {
@@ -409,6 +482,9 @@ void PrefetchRowPool::mark_ready(const at::Tensor& slot_ids) {
     // 第二遍发布：此时数据已写完。无引用的槽直接进入 LRU，可被后续请求复用或回收。
     auto& slot = slots_[slot_id];
     slot.state = State::READY;
+    if (track_stats_) {
+      slot.used = false;
+    }
     --pending_slots_;
     ++ready_slots_;
     if (slot.references == 0) {
@@ -427,6 +503,8 @@ PrefetchRowResolution PrefetchRowPool::resolve(std::int64_t layer_id, const at::
   result.handle->slots_.reserve(static_cast<std::size_t>(row_ids.numel()));
   result.handle->missing_row_ids_ = cpu_ids({});
   result.handle->missing_slot_ids_ = cpu_ids({});
+  result.handle->row_ids_ = result.handle->missing_row_ids_;
+  result.handle->slot_ids_ = result.handle->missing_slot_ids_;
   std::unordered_set<std::int64_t> pinned;
   pinned.reserve(static_cast<std::size_t>(row_ids.numel()));
   std::lock_guard lock(mutex_);
@@ -441,9 +519,8 @@ PrefetchRowResolution PrefetchRowPool::resolve(std::int64_t layer_id, const at::
         continue;
       }
       const auto slot_id = found->second;
-      require_healthy(slots_[slot_id]);
       if (slots_[slot_id].state != State::READY) {
-        continue;  // PENDING 的行还在读，按未命中处理，由 forward 同步补读。
+        continue;  // 只有 READY 可复制到 batch 暂存区。
       }
       // 同一槽可能被多个查询位置命中，只 pin 一次，避免句柄里出现重复引用。
       if (pinned.insert(slot_id).second) {
@@ -460,14 +537,14 @@ PrefetchRowResolution PrefetchRowPool::resolve(std::int64_t layer_id, const at::
   return result;
 }
 
-void PrefetchRowPool::release(const std::shared_ptr<PrefetchRowHandle>& handle) {
+void PrefetchRowPool::release(const std::shared_ptr<PrefetchRowHandle>& handle, bool discard_pending) {
   std::lock_guard lock(mutex_);
   require_handle(handle);
   if (handle->released_) {
     return;
   }
   require_open();
-  release_slots(*handle);
+  release_slots(*handle, discard_pending);
 }
 
 void PrefetchRowPool::cancel(const std::shared_ptr<PrefetchRowHandle>& handle) {

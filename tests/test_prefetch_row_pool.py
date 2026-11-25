@@ -144,6 +144,41 @@ def test_acquire_is_atomic_when_existing_cache_must_be_kept(make_pool: Callable[
     pool.cancel(handle=replacement)
 
 
+def test_resolve_only_pins_ready_rows_when_pool_is_full(make_pool: Callable[..., Any]) -> None:
+    """完成标准 1：空间不足时普通 acquire 原子失败；组装只加 READY 引用。"""
+    pool = make_pool(slots=2)
+    cached = pool.acquire(layer_id=1, row_ids=ids([3]))
+    publish(pool, cached)
+    pool.release(handle=cached)
+    pending = pool.acquire(layer_id=1, row_ids=ids([5]))
+    requested = ids([9, 5, 3, 9, 12])
+    assert pool.available_slots() == 1
+    assert pool.slots_needed(layer_id=1, row_ids=requested) == 3
+    assert pool.slots_needed(layer_id=1, row_ids=requested, limit=1) == 2
+    before = pool.stats()
+    assert pool.acquire(layer_id=1, row_ids=requested) is None
+    assert pool.stats() == before
+    ready = pool.resolve(layer_id=1, row_ids=requested)
+    assert torch.equal(ready.slot_ids, ids([-1, -1, cached.slot_ids.item(), -1, -1]))
+    assert pool.stats()["pending_slots"] == 1
+    pool.release(handle=ready.handle)
+    pool.cancel(handle=pending)
+
+
+def test_discard_pending_recycles_only_last_reference(make_pool: Callable[..., Any]) -> None:
+    """完成标准 1/4：跨任务共享 PENDING 直到最后一个引用取消，随后槽可复用。"""
+    pool = make_pool(slots=1)
+    first = pool.acquire(layer_id=14, row_ids=ids([2]))
+    second = pool.acquire(layer_id=14, row_ids=ids([2]))
+    pool.release(handle=first, discard_pending=True)
+    assert torch.equal(pool.pending_slots(layer_id=14, row_ids=ids([2])), second.slot_ids)
+    assert pool.available_slots() == 0
+    pool.release(handle=second, discard_pending=True)
+    assert torch.equal(pool.pending_slots(layer_id=14, row_ids=ids([2])), ids([-1]))
+    assert pool.available_slots() == 1
+    assert pool.stats()["pending_slots"] == pool.stats()["referenced_slots"] == 0
+
+
 def test_lru_only_evicts_unreferenced_ready(make_pool: Callable[..., Any]) -> None:
     """A3：resolve 临时引用保护 READY，释放后按最近使用次序淘汰。"""
     pool = make_pool(slots=2)
@@ -159,6 +194,44 @@ def test_lru_only_evicts_unreferenced_ready(make_pool: Callable[..., Any]) -> No
     assert pool.acquire(layer_id=1, row_ids=ids([40])) is None
     pool.release(handle=result.handle)
     pool.cancel(handle=replacement)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_eviction_counts_ready_slots_without_hits(make_pool: Callable[..., Any], enabled: bool) -> None:
+    """A3：用 enabled 控制池统计，验证 READY 命中、PENDING 复用和被重用槽的淘汰计数。"""
+    pool = make_pool(slots=3, track_stats=enabled)
+    initial = pool.acquire(layer_id=1, row_ids=ids([10, 20, 30]))
+    pending = pool.acquire(layer_id=1, row_ids=ids([30]))
+    pool.release(handle=pending)
+    publish(pool, initial)
+    pool.release(handle=initial)
+
+    resolved = pool.resolve(layer_id=1, row_ids=ids([10, 10]))
+    assert resolved.hit_mask.all().item()
+    pool.release(handle=resolved.handle)
+    acquired = pool.acquire(layer_id=1, row_ids=ids([20]))
+    assert acquired.missing_row_ids.numel() == 0
+    pool.release(handle=acquired)
+
+    # 只在 PENDING 时被复用的 30 最先被淘汰，计作未用。
+    replacement = pool.acquire(layer_id=1, row_ids=ids([40]))
+    snapshot = pool.stats()
+    assert snapshot["evicted_slots"] == snapshot["evicted_unused_slots"] == int(enabled)
+    publish(pool, replacement)
+    pool.release(handle=replacement)
+
+    # 淘汰余下两种 READY 命中及未用的 40，随后重用原先命中过的槽并再次淘汰。
+    replacement = pool.acquire(layer_id=1, row_ids=ids([50, 60, 70]))
+    snapshot = pool.stats()
+    assert snapshot["evicted_slots"] == (4 if enabled else 0)
+    assert snapshot["evicted_unused_slots"] == (2 if enabled else 0)
+    publish(pool, replacement)
+    pool.release(handle=replacement)
+    last = pool.acquire(layer_id=1, row_ids=ids([80]))
+    snapshot = pool.stats()
+    assert snapshot["evicted_slots"] == (5 if enabled else 0)
+    assert snapshot["evicted_unused_slots"] == (3 if enabled else 0)
+    pool.cancel(handle=last)
 
 
 def test_pending_zero_references_stays_until_io_publication(make_pool: Callable[..., Any]) -> None:
@@ -205,7 +278,7 @@ def test_cancel_borrower_does_not_fail_shared_pending(make_pool: Callable[..., A
 
 
 def test_cancel_producer_fails_shared_pending_without_permanent_wait(make_pool: Callable[..., Any]) -> None:
-    """A3：生产者取消共享 PENDING 后显式失败，最后引用释放即回收。"""
+    """A3：取消共享 PENDING 后普通预取感知失败，批次组装将该行视为缺失。"""
     pool = make_pool(slots=1)
     producer = pool.acquire(layer_id=1, row_ids=ids([3]))
     borrower = pool.acquire(layer_id=1, row_ids=ids([3]))
@@ -214,8 +287,9 @@ def test_cancel_producer_fails_shared_pending_without_permanent_wait(make_pool: 
         pool.is_ready(handle=borrower)
     with pytest.raises(RuntimeError, match="cancelled"):
         pool.acquire(layer_id=1, row_ids=ids([3]))
-    with pytest.raises(RuntimeError, match="cancelled"):
-        pool.resolve(layer_id=1, row_ids=ids([3]))
+    result = pool.resolve(layer_id=1, row_ids=ids([3]))
+    assert not result.hit_mask.item()
+    pool.release(handle=result.handle)
     pool.release(handle=borrower)
     assert pool.stats()["occupied_slots"] == 0
     replacement = pool.acquire(layer_id=1, row_ids=ids([3]))

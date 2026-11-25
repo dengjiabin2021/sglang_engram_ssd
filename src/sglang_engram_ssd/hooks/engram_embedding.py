@@ -10,6 +10,7 @@ from sglang.srt.plugins.hook_registry import (
     plugin_hook as register_hook,
 )
 
+from ..timing import get_timer
 from ._registry import _EMBED_FINISH, _EMBED_FORWARD, _EMBED_INIT
 
 if TYPE_CHECKING:
@@ -71,7 +72,7 @@ def forward_ssd_embedding(
     输入：original_fn 为官方 forward；self 为 Embedding；indices 为 GPU int32／int64 [T,C] 全局行号，
         可重复、无需 contiguous，须在表范围内；forward_batch 为可选批元数据；cp_all_tokens 不允许为 True。
     输出：GPU BF16 [T,C,D] 合并结果；runtime 不存在时完全调用原 forward。
-    纯 prefill 可消费行池，decode／mixed batch 同步读取；所有 rank 须保持模型调用顺序以匹配 TP collective。
+    已登记的纯 prefill 和 decode 从显存缓冲 gather，其余批次同步读取；TP 合并保持原调用顺序。
     """
     runtime = getattr(self, "ssd", None)
     if runtime is None:
@@ -80,17 +81,23 @@ def forward_ssd_embedding(
         raise ValueError("Engram SSD does not support context-parallel lookup")
     if forward_batch is not None and forward_batch.contains_mm_inputs():
         raise ValueError("Engram SSD currently supports text-only requests")
-    if (
-        runtime.sched_prefetch_enabled and forward_batch is not None
-        and forward_batch.forward_mode.is_extend() and not forward_batch.forward_mode.is_mixed()
-    ):
-        # 使用真实 GPU Hasher 产出的行号查池，预测未命中仍由 runtime 同步补齐。
-        out = runtime.lookup_from_pool(layer_id=self.layer_id, indices=indices)
-    else:
-        # Decode／mixed batch 不消费此行池，保留同步路径。
-        out = runtime.lookup(layer_id=self.layer_id, indices=indices)
-    # 模型原 Engram 位置每层合并一次，保持与主干 TP 通信的执行顺序。
-    return runtime.reduce_output(out)
+
+    def run() -> torch.Tensor:
+        """本层查询加一次 TP 合并。"""
+        if runtime.sched_prefetch_enabled and forward_batch is not None:
+            out = runtime.lookup_batch(layer_id=self.layer_id, indices=indices, forward_batch=forward_batch)
+        else:
+            out = runtime.lookup(layer_id=self.layer_id, indices=indices)
+        # 模型原 Engram 位置每层合并一次，保持与主干 TP 通信的执行顺序。
+        return runtime.reduce_output(out)
+
+    timer = get_timer()
+    if timer is None:
+        return run()
+    # 本 forward 已绑定预取缓冲时带上本层紧急缺行数，计时日志据此区分全命中。
+    batch = runtime._batch[1] if runtime._batch is not None else None
+    urgent = batch.urgent.get(self.layer_id, 0) if batch is not None and batch.forward is forward_batch else None
+    return timer.run(forward_batch=forward_batch, fn=run, urgent=urgent)
 
 
 # sglang/python/sglang/srt/layers/engram.py：EngramEmbedding.finish_load(self, label: str)

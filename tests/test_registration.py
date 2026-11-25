@@ -35,6 +35,12 @@ else:
         assert "sglang_engram_ssd.sched_prefetch" not in sys.modules
     else:
         assert set(SCHED_PREFETCH_HOOK_TARGETS) <= registered
+        from sglang.srt.plugins.hook_registry import HookType
+        from sglang_engram_ssd.hooks._registry import _HASH_FORWARD, _PREFILL_PRIORITY, _RUN_BATCH
+        assert {hook_type for hook_type, _, _ in HookRegistry._hooks[_RUN_BATCH]} == {HookType.BEFORE, HookType.AFTER}
+        assert HookRegistry._hooks[_HASH_FORWARD][0][0] is HookType.AFTER
+        assert HookRegistry._hooks[_PREFILL_PRIORITY][0][0] is HookType.AFTER
+        assert not any(target.endswith(".process_batch_result_decode") for target in registered)
 assert "sglang_engram_ssd.query._C" not in sys.modules
 """
     completed = subprocess.run(

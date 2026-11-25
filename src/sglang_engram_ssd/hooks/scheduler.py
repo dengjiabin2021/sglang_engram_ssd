@@ -66,7 +66,7 @@ def schedule_engram_prefill(
 
     输入：original_fn 为原生未绑定函数，self 为 scheduler；
         prefill_delayer_single_pass/running_batch 与原函数同义并原样传递。
-    输出：原函数返回的 batch/running_batch 结果；控制器负责筛选、早退预取和统一失败同步。
+    输出：原函数返回的 batch/running_batch 结果；控制器负责窗口对账及统一失败同步。
     所有分支均调用 original_fn，Hook 不复制原生调度实现。
     """
     runtime = _runtime(owner=self)
@@ -83,19 +83,33 @@ def schedule_engram_prefill(
 # sglang/python/sglang/srt/managers/schedule_policy.py: SchedulePolicy.calc_priority(
 #     self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None, processed_tokens: int = 0)
 @register_hook(_PREFILL_PRIORITY, type=HookType.AFTER)
-def filter_engram_candidates(
+def reconcile_engram_window(
     function_result: Any, self: Any, waiting_queue: list[Req],
     running_batch: Optional[ScheduleBatch] = None, processed_tokens: int = 0,
 ) -> None:
-    """在原生 priority 排序后触发当前 raw 调度的候选筛选。
+    """在原生 priority 排序后更新当前 raw 调度的预取窗口。
 
     输入：function_result 为原结果，忽略；self 为 SchedulePolicy；waiting_queue 为原生可变 Req 列表；
-        running_batch/processed_tokens 保留原签名，Hook 不使用或修改二者。
-    输出：无返回值；仅在插件包围的 raw 上下文中由控制器原地筛选，不改变 priority 返回值。
+        running_batch 用于推算请求数上限；processed_tokens 保留原签名。
+    输出：无返回值；当前 raw 调度的队列只读，有 prefill 需求时同步后台失败。
     """
-    from ..sched_prefetch import filter_active_waiting_queue
+    from ..sched_prefetch import reconcile_active_window
 
-    filter_active_waiting_queue(waiting_queue=waiting_queue)
+    reconcile_active_window(waiting_queue=waiting_queue, running_batch=running_batch)
+
+
+# sglang/python/sglang/srt/managers/scheduler.py: Scheduler.run_batch(
+#     self, batch: ScheduleBatch, pp_proxy_tensors: Optional[PPProxyTensors] = None)
+@register_hook(_RUN_BATCH, type=HookType.BEFORE)
+def prepare_engram_batch(self: Any, batch: ScheduleBatch, pp_proxy_tensors: Optional[PPProxyTensors] = None) -> None:
+    """在原生 run_batch 前提交 prefill 组装，或给 decode 登记缓冲区。
+
+    输入：self 为 scheduler，batch 为已选好的 ScheduleBatch，pp_proxy_tensors 为原函数参数。
+    输出：无返回值；预取开启时转交控制器，在调用原 forward 前返回。
+    """
+    runtime = _runtime(owner=self)
+    if runtime is not None:
+        runtime.get_sched_prefetch(scheduler=self).start_batch(batch=batch, iteration=self.forward_ct + 1)
 
 
 # sglang/python/sglang/srt/managers/scheduler.py: Scheduler.run_batch(
@@ -105,14 +119,15 @@ def record_engram_batch(
     function_result: Any, self: Any, batch: ScheduleBatch,
     pp_proxy_tensors: Optional[PPProxyTensors] = None,
 ) -> None:
-    """在原生 forward 提交后记录不可变的消费快照。
+    """在原生 forward 提交后记录计算流事件和 prefill 消费快照。
 
     输入：function_result 为原 forward 结果，忽略；self 为 scheduler；batch 为本次 ScheduleBatch；
         pp_proxy_tensors 保留原签名，不使用；当前插件不支持 PP。
-    输出：无返回值；启用时转交控制器保存版本与 token 区间，不修改模型输出。
+    输出：无返回值；启用时标记本批缓冲使用结束，并保存结果处理需要的 token 区间。
     """
     runtime = _runtime(owner=self)
     if runtime is not None:
+        runtime.end_batch(batch=batch)
         runtime.get_sched_prefetch(scheduler=self).record_batch(batch=batch)
 
 

@@ -15,6 +15,7 @@ _EMBED_INIT = "sglang.srt.layers.engram.EngramEmbedding.__init__"
 _EMBED_FORWARD = "sglang.srt.layers.engram.EngramEmbedding.forward"
 _EMBED_FINISH = "sglang.srt.layers.engram.EngramEmbedding.finish_load"
 _HASH_INIT = "sglang.srt.layers.engram.EngramHasher.__init__"
+_HASH_FORWARD = "sglang.srt.layers.engram.EngramHasher.forward"
 _ADD_TO_QUEUE = "sglang.srt.managers.scheduler.Scheduler._add_request_to_queue"
 _GET_PREFILL = "sglang.srt.managers.scheduler.Scheduler._get_new_batch_prefill_raw"
 _PREFILL_PRIORITY = "sglang.srt.managers.schedule_policy.SchedulePolicy.calc_priority"
@@ -28,7 +29,8 @@ HOOK_TARGETS = (
     _EMBED_INIT, _EMBED_FORWARD, _EMBED_FINISH,
 )
 SCHED_PREFETCH_HOOK_TARGETS = (
-    _HASH_INIT, _ADD_TO_QUEUE, _GET_PREFILL, _PREFILL_PRIORITY, _RUN_BATCH, _RESULT_PREFILL,
+    _HASH_INIT, _HASH_FORWARD, _ADD_TO_QUEUE, _GET_PREFILL, _PREFILL_PRIORITY, _RUN_BATCH,
+    _RESULT_PREFILL,
 )
 
 

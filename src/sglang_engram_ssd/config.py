@@ -22,6 +22,10 @@ _RETIRED_NAMES = (
     "SGLANG_ENABLE_DSV41_ENGRAM_SSD_PIPELINE",
     "SGLANG_ENABLE_DSV41_ENGRAM_SSD_PREFETCH",
     "SGLANG_DSV41_ENGRAM_SSD_PREFETCH_LAYERS",
+    "SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_SEGMENT_TOKENS",
+    "SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_POLICY",
+    "SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_TIMEOUT_MS",
+    "SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_MAX_DEFER_MS",
 )
 
 
@@ -38,11 +42,28 @@ class EngramSsdConfig:
     chunk_rows: int  # 同步中转区最多容纳的查询行数 Q，必须为正。
     dedup_enabled: bool = False  # 仅控制同步查询的 unique／inverse，不影响行池自身去重。
     sched_prefetch_enabled: bool = False  # 控制调度预取相关 Hook、行池与后台 reader 的创建。
-    pool_bytes: int = 2147483648  # 每 rank 的压缩行 payload 预算，单位字节，不含元数据／分配器开销。
-    segment_tokens: int = 0  # 每段 token 数；0 由控制器取 chunk 长度或 8192。
-    policy: str = "timeout"  # 取值为 best_effort、wait_complete 或 timeout。
-    timeout_ms: int = 500  # timeout 策略等待毫秒数；其他策略未提交请求的防饥饿仍使用默认值。
+    window_batches: int = 2  # 每轮最多推算的 prefill 批数。
+    pool_batches: int | None = None  # 按批数定容；两个池配置都为空时取 window_batches + 1。
+    pool_bytes: int | None = None  # 每 rank 的行数据字节预算，不含元数据和分配器开销。
     log_interval: int = 0  # 每多少次 prefill 输出统计；0 表示不启用采样与累计计时。
+    debug_check_rows: bool = False  # 在 prefill 逐位核对 CPU 和 GPU 全局行号。
+
+    def resolve_pool_bytes(self, *, tokens: int, layers: int, columns: int, dim: int, tp_size: int) -> int:
+        """按模型布局和 prefill 预算计算本 rank 的行池大小。
+
+        输入：tokens 为每批 token 预算，layers/columns 为 Engram 层数和哈希列数，dim 为行宽，
+            tp_size 为 TP rank 数。输出：行数据字节数；实际槽容量必须严格大于窗口所需槽数。
+        """
+        row_bytes = dim + dim // 32
+        # 每批预计查询行数加 10% owner 分布余量，向上取整到完整行。
+        batch_rows = (tokens * layers * columns * 11 + tp_size * 10 - 1) // (tp_size * 10)
+        size = self.pool_bytes
+        if size is None:
+            batches = self.pool_batches if self.pool_batches is not None else self.window_batches + 1
+            size = batches * batch_rows * row_bytes
+        if size // row_bytes <= self.window_batches * batch_rows:
+            raise ValueError("Engram SSD SCHED_PREFETCH_POOL_BYTES must hold more rows than the prefetch window")
+        return size
 
 
 def should_register_hooks() -> bool:
@@ -96,30 +117,37 @@ def get_config() -> EngramSsdConfig:
         raise ValueError("Engram SSD IO_URING_QUEUE_DEPTH and CHUNK_ROWS must be positive")
     sched_enabled = _boolean("SGLANG_ENABLE_DSV41_ENGRAM_SSD_SCHED_PREFETCH")
     prefix = "SGLANG_DSV41_ENGRAM_SSD_SCHED_PREFETCH_"
-    names = ("POOL_BYTES", "SEGMENT_TOKENS", "POLICY", "TIMEOUT_MS", "LOG_INTERVAL")
-    pool_bytes, segment_tokens, policy, timeout_ms, log_interval = 2147483648, 0, "timeout", 500, 0
+    names = ("WINDOW_BATCHES", "POOL_BATCHES", "POOL_BYTES", "LOG_INTERVAL")
+    debug_name = "SGLANG_ENABLE_DSV41_ENGRAM_SSD_DEBUG_CHECK_ROWS"
+    window_batches, pool_batches, pool_bytes = 2, None, None
+    log_interval = 0
     if sched_enabled:
         # 只有功能生效才解析其数值；关闭功能时的无效参数不能阻止原同步路径启动。
-        pool_bytes = int(os.getenv(prefix + "POOL_BYTES", "2147483648"))
-        segment_tokens = int(os.getenv(prefix + "SEGMENT_TOKENS", "0"))
-        policy = os.getenv(prefix + "POLICY", "timeout").lower()
+        window_batches = int(os.getenv(prefix + "WINDOW_BATCHES", "2"))
+        batch_value = os.getenv(prefix + "POOL_BATCHES")
+        byte_value = os.getenv(prefix + "POOL_BYTES")
+        if batch_value is not None and byte_value is not None:
+            raise ValueError(f"{prefix}POOL_BATCHES and {prefix}POOL_BYTES are mutually exclusive")
+        pool_batches = int(batch_value) if batch_value is not None else None
+        pool_bytes = int(byte_value) if byte_value is not None else None
+        if window_batches <= 0 or (pool_bytes is not None and pool_bytes <= 0):
+            raise ValueError(f"{prefix}WINDOW_BATCHES and {prefix}POOL_BYTES must be positive")
+        if pool_batches is not None and pool_batches <= window_batches:
+            raise ValueError(f"{prefix}POOL_BATCHES must exceed {prefix}WINDOW_BATCHES")
+
         log_interval = int(os.getenv(prefix + "LOG_INTERVAL", "0"))
-        if policy not in {"best_effort", "wait_complete", "timeout"}:
-            raise ValueError(prefix + "POLICY must be best_effort, wait_complete, or timeout")
-        if policy == "timeout":
-            timeout_ms = int(os.getenv(prefix + "TIMEOUT_MS", "500"))
-        elif prefix + "TIMEOUT_MS" in os.environ:
-            # 其他策略不采用显式等待值；保留默认值供未提交请求的防饥饿规则使用。
-            logger.warning("Ignoring %sTIMEOUT_MS: POLICY is not timeout", prefix)
-        if pool_bytes <= 0 or segment_tokens < 0 or log_interval < 0 or timeout_ms < 0:
-            raise ValueError("Engram SSD prefetch requires positive POOL_BYTES and nonnegative segment/time/log values")
+        if log_interval < 0:
+            raise ValueError(f"{prefix}LOG_INTERVAL must be nonnegative")
     else:
         for suffix in names:
             if prefix + suffix in os.environ:
                 logger.warning("Ignoring %s%s: SCHED_PREFETCH is disabled", prefix, suffix)
+        if debug_name in os.environ:
+            logger.warning("Ignoring %s: SCHED_PREFETCH is disabled", debug_name)
     return EngramSsdConfig(
         enabled=enabled, io_uring_queue_depth=queue_depth, chunk_rows=chunk_rows,
         dedup_enabled=_boolean("SGLANG_ENABLE_DSV41_ENGRAM_SSD_DEDUP"),
-        sched_prefetch_enabled=sched_enabled, pool_bytes=pool_bytes,
-        segment_tokens=segment_tokens, policy=policy, timeout_ms=timeout_ms, log_interval=log_interval,
+        sched_prefetch_enabled=sched_enabled, window_batches=window_batches, pool_batches=pool_batches,
+        pool_bytes=pool_bytes, log_interval=log_interval,
+        debug_check_rows=sched_enabled and _boolean(debug_name),
     )

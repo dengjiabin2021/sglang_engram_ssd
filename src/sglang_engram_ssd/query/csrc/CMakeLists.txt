@@ -38,7 +38,7 @@ if(ENGRAM_SSD_BUILD_PYTHON)
       REQUIRED)
 
   Python3_add_library(_C MODULE WITH_SOABI bindings.cpp)
-  target_link_libraries(_C PRIVATE engram_ssd_query ${TORCH_PYTHON_LIBRARY})
+  target_link_libraries(_C PRIVATE engram_ssd_query ${TORCH_PYTHON_LIBRARY} CUDA::cuda_driver)
   # 放到当前源码包，现有 editable 安装即可通过 query._C 加载。
   set_target_properties(
       _C PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/..")

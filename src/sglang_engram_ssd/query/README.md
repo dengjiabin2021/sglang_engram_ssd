@@ -16,7 +16,7 @@ cmake -S src/sglang_engram_ssd/query/csrc -B build/query \
 cmake --build build/query --parallel 4
 ```
 
-需要当前环境的 Torch、Python 开发头文件和 liburing 开发文件。liburing 是必需依赖；可向 CMake 显式传入 `LIBURING_INCLUDE_DIR`、`LIBURING_LIBRARY` 指向已手动准备的文件。扩展写入 `query/_C*.so`，editable 安装不会自动编译。
+需要当前环境的 Torch、CUDA Toolkit、Python 开发头文件和 liburing 开发文件。扩展链接 CUDA Driver 以提交 decode 的流标志操作。liburing 是必需依赖；可向 CMake 显式传入 `LIBURING_INCLUDE_DIR`、`LIBURING_LIBRARY` 指向已手动准备的文件。扩展写入 `query/_C*.so`，editable 安装不会自动编译。
 
 ## 同步接口
 
@@ -52,17 +52,21 @@ reader.close()
 
 | 接口 | 生命周期约定 |
 |---|---|
-| `acquire(layer_id=..., row_ids=...)` | 去重并固定槽，返回 handle；空间不足返回 None，不阻塞；空行集合返回就绪空 handle |
+| `acquire(layer_id=..., row_ids=...)` | 为普通预取段去重并固定槽，全部行放得下时取得引用，空间不足时返回 None |
+| `handle.row_ids`／`slot_ids` | 按首次出现顺序去重后的 CPU int64 全局行号与槽号 |
 | `handle.missing_row_ids`／`missing_slot_ids` | 只包含本次新建 PENDING 行；同步读取返回后调用 `mark_ready(slot_ids=...)` |
+| `pending_slots(layer_id=..., row_ids=...)` | 按输入位置返回 PENDING 槽，其它位置为 `-1`。仅查元数据，使用前须持有槽引用 |
+| `available_slots()`／`slots_needed(layer_id=..., row_ids=..., limit=-1)` | 查询空闲加 LRU 槽数，以及这些行尚需占用的可用槽数。设定非负 `limit` 时，所需槽数超过它即可结束统计 |
 | `is_ready(handle=...)` | 全部槽 READY 才为真；失败 key 显式抛错 |
 | `resolve(layer_id=..., row_ids=...)` | 返回 `slot_ids`、`hit_mask`、临时 `handle`；只命中 READY，并保留输入顺序与重复 |
-| `release(handle=...)` | 归还引用；I/O 未完成的 PENDING 即使零引用也不能被复用 |
+| `release(handle=..., discard_pending=False)` | 归还引用。普通段撤销时设为 `True` 以回收零引用 PENDING，共享槽由其它段继续读取。在途写入须始终有槽引用 |
 | `cancel(handle=...)` | 仅在未提交 I/O 或 I/O 已收齐失败后撤销自建 PENDING；共享失败 key 显式报错直到全部引用归还 |
 | `stats()` | 锁内快照；累计计数只在 track_stats 时更新 |
 | `record_submitted(rows=...)` | 在实际交付 reader 前计数；acquire／取消占槽不算读取提交 |
 | `close()` | 要求全部 I/O 与引用已结束，存在 PENDING 或引用时拒绝关闭 |
 
-池的 `weight`／`scale` 为4096起点对齐的 pinned 表，`weight_device_ptr`／`scale_device_ptr` 供原生 gather 直接访问。
-行步长单独保存；当前两张表连续，分别为 D 和 D/32。slab 起点对齐不代表未来任意行读已经满足 DIO 对齐。
+池的 `weight`／`scale` 为起点 4096 对齐的连续 pinned 表，行步长分别为 D 和 D/32。每个 acquire／resolve 句柄由调用方归还，批次组装方在 READY 行复制到调用方暂存区后归还 resolve 引用。
 
-每个 acquire／resolve handle 都由调用方释放。GPU gather 使用过的 resolve handle 必须等对应 CUDA event 完成后再 release；不能只因为 CPU 函数返回就归还槽位。
+普通段仍使用 `pending_slots` 在块提交前跳过其它段已经发布的共享槽。紧急读取查询 READY，其余行通过同一个 `read_rows_to_slots` 直接写到调用方的 batch 暂存区。
+
+decode 使用扩展的 `stream_flag_address` 探测映射标志及流等待支持。CPU pinned int32 `[1]` 标志由 `reset_stream_flag` 在旁路流清零。暂存数据写完后由 `set_stream_flag` 置位，拷贝流等到标志为 1 才执行 H2D，计算流只等 H2D event。

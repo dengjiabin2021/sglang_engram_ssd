@@ -21,7 +21,9 @@ import uuid
 _STATS_MARKER = "Engram SSD sched prefetch stats: "
 _COUNTERS = (
     "submitted_rows", "dedup_saved_rows", "forward_hits", "forward_misses",
-    "miss_read_ms", "deferred_requests",
+    "miss_read_ms", "prefill_wait_ms", "prefill_waits", "decode_wait_ms", "decode_waits",
+    "urgent_rows", "predicted_spans", "matched_spans", "read_ms", "read_rows",
+    "evicted_slots", "evicted_unused_slots",
 )
 
 
@@ -41,7 +43,10 @@ def _load_workload(path: Path) -> tuple[list[dict[str, Any]], str]:
             not case["input_ids"] or not all(isinstance(i, int) and i >= 0 for i in case["input_ids"])
         ):
             raise ValueError(f"{case['id']}: input_ids must be a nonempty list of nonnegative integers")
-        cases.append({key: case[key] for key in ("id", "text", "input_ids") if key in case})
+        # 可选的逐条输出长度，覆盖命令行 --max-new-tokens，用于让请求错开结束。
+        if "max_new_tokens" in case and not (isinstance(case["max_new_tokens"], int) and case["max_new_tokens"] > 0):
+            raise ValueError(f"{case['id']}: max_new_tokens must be a positive integer")
+        cases.append({key: case[key] for key in ("id", "text", "input_ids", "max_new_tokens") if key in case})
     if not cases or len({case["id"] for case in cases}) != len(cases):
         raise ValueError("Workload must contain nonempty cases with distinct ids")
     encoded = json.dumps(cases, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -58,9 +63,19 @@ def _request_json(url: str, body: dict[str, Any] | None, timeout: float) -> Any:
 
 def _generate(
     *, url: str, case: dict[str, Any], rid: str, max_new_tokens: int,
-    timeout: float, ignore_eos: bool, started: threading.Event,
+    timeout: float, command: str, started: threading.Event,
 ) -> dict[str, Any]:
+    """发起一条流式生成请求并记录实际 token 和客户端时延。
+
+    输入：url 为服务地址，case 为输入用例，rid 为请求标识；max_new_tokens 和 timeout
+        分别限制输出长度和 HTTP 等待秒数，用例自带 max_new_tokens 时以用例为准。
+        command 选择采样及中止检查，started 在发出 HTTP 前置位。
+    输出：含 token ID、完成原因、TTFT、TPOT 和总延迟的记录；请求错误写入 error。
+    """
+    max_new_tokens = case.get("max_new_tokens", max_new_tokens)
     body = {key: case[key] for key in ("text", "input_ids") if key in case}
+    # 多 token 性能轮固定输出长度；压力轮也禁用 EOS，给 abort 和 retract 留出时间。
+    ignore_eos = command == "stress" or (command == "perf" and max_new_tokens > 1)
     body.update({
         "rid": rid, "stream": True, "return_logprob": True,
         "logprob_start_len": -1, "top_logprobs_num": 0, "return_text_in_logprobs": False,
@@ -113,18 +128,26 @@ def _generate(
         finish = metadata.get("finish_reason")
         if finish is None:
             raise RuntimeError("Stream ended without a final finish_reason")
-        if finish.get("type") == "abort" and not ignore_eos:
+        if finish.get("type") == "abort" and command != "stress":
             raise RuntimeError("A non-stress generation was unexpectedly aborted")
         if not output_ids and finish.get("type") != "abort":
             raise RuntimeError("No output token IDs returned; return_logprob is required")
+        if command == "perf" and len(output_ids) != max_new_tokens:
+            raise RuntimeError(f"Expected {max_new_tokens} output tokens, got {len(output_ids)}")
         error = None
     except (HTTPError, URLError, OSError, ValueError, RuntimeError) as exc:
         error = f"{type(exc).__name__}: {exc}"
         finish = metadata.get("finish_reason")
+    latency_ms = (time.perf_counter() - began) * 1000
+    # 首个 token 已计入 TTFT，余下输出间隔共 len(output_ids) - 1 个。
+    tpot_ms = (
+        (latency_ms - first_token_ms) / (len(output_ids) - 1)
+        if first_token_ms is not None and len(output_ids) > 1 else None
+    )
     return {
         "id": case["id"], "rid": rid, "output_token_ids": output_ids,
         "finish_reason": finish, "error": error,
-        "ttft_ms": first_token_ms, "latency_ms": (time.perf_counter() - began) * 1000,
+        "ttft_ms": first_token_ms, "tpot_ms": tpot_ms, "latency_ms": latency_ms,
         "prompt_tokens": metadata.get("prompt_tokens"), "cached_tokens": metadata.get("cached_tokens"),
         "num_retractions": metadata.get("num_retractions", 0),
     }
@@ -166,6 +189,11 @@ def _read_server_log(path: Path | None) -> dict[str, Any]:
 
 
 def _log_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """计算单轮服务日志的逐 rank 统计。
+
+    输入：before、after 为同一服务在请求前后的日志快照。
+    输出：两次均有快照的 rank 的累计计数差值和派生指标，分母为零时相应比率为空。
+    """
     deltas = {}
     old = before.get("latest_pool_snapshots_by_rank", {})
     for rank, current in after.get("latest_pool_snapshots_by_rank", {}).items():
@@ -181,6 +209,17 @@ def _log_delta(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
         if "forward_hits" in delta and "forward_misses" in delta:
             count = delta["forward_hits"] + delta["forward_misses"]
             delta["forward_pool_hit_rate"] = delta["forward_hits"] / count if count else None
+        # 窗口命中率已经按唯一 owner 行累计，直接保留结束时的控制器口径。
+        if "window_hit_rate" in current:
+            delta["window_hit_rate"] = current["window_hit_rate"]
+        for metric, amount, count in (
+            ("avg_prefill_wait_ms", "prefill_wait_ms", "prefill_waits"),
+            ("avg_decode_wait_ms", "decode_wait_ms", "decode_waits"),
+            ("span_match_rate", "matched_spans", "predicted_spans"),
+            ("wasted_read_ratio", "evicted_unused_slots", "read_rows"),
+        ):
+            if amount in delta and count in delta:
+                delta[metric] = delta[amount] / delta[count] if delta[count] else None
         deltas[rank] = delta
     return deltas
 
@@ -198,6 +237,11 @@ def _new_idle_snapshots(before: dict[str, Any], after: dict[str, Any], tp_size: 
 
 
 def _run(args: argparse.Namespace) -> dict[str, Any]:
+    """按固定负载并发发起请求并汇总一轮验收结果。
+
+    输入：args 提供负载路径、服务地址、并发、输出长度、日志和可选的中止参数。
+    输出：可写入 JSON 的逐条记录、客户端统计和逐 rank 日志计数差值。
+    """
     cases, workload_hash = _load_workload(path=args.workload)
     before_log = _read_server_log(path=args.server_log)
     records = []
@@ -212,7 +256,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             future = executor.submit(
                 _generate, url=args.url.rstrip("/"), case=case, rid=rid,
                 max_new_tokens=args.max_new_tokens, timeout=args.timeout,
-                ignore_eos=args.command == "stress", started=started,
+                command=args.command, started=started,
             )
             futures[future] = case["id"]
             if args.command == "stress" and index < args.concurrency and index % 4 == 0:
@@ -232,7 +276,10 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             records.append(future.result())
     elapsed = time.perf_counter() - began
     after_log = _read_server_log(path=args.server_log)
-    if args.command == "stress" and args.server_log is not None:
+    if args.server_log is not None and (
+        args.command == "stress" or (args.command == "perf" and before_log.get("latest_pool_snapshots_by_rank"))
+    ):
+        # 性能轮也收齐末尾 decode 的计数。等待日志的时间不计入客户端吞吐。
         deadline = time.monotonic() + args.idle_wait_seconds
         while not _new_idle_snapshots(before=before_log, after=after_log, tp_size=args.tp_size):
             if time.monotonic() >= deadline:
@@ -240,7 +287,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             time.sleep(0.25)
             after_log = _read_server_log(path=args.server_log)
     ttfts = sorted(row["ttft_ms"] for row in records if row["ttft_ms"] is not None)
+    tpots = sorted(row["tpot_ms"] for row in records if row["tpot_ms"] is not None)
     prompt_tokens = sum(int(row["prompt_tokens"] or 0) for row in records if row["error"] is None)
+    output_tokens = sum(len(row["output_token_ids"]) for row in records if row["error"] is None)
     errors = [row["id"] for row in records if row["error"]]
     abort_rids = {row["rid"] for row in abort_attempts}
     aborted = [row["rid"] for row in records if (row["finish_reason"] or {}).get("type") == "abort"]
@@ -256,7 +305,11 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             "client_ttft_mean_ms": statistics.mean(ttfts) if ttfts else None,
             "client_ttft_p50_ms": statistics.median(ttfts) if ttfts else None,
             "client_ttft_p95_ms": ttfts[max(0, (len(ttfts) * 95 + 99) // 100 - 1)] if ttfts else None,
+            "client_tpot_mean_ms": statistics.mean(tpots) if tpots else None,
+            "client_tpot_p50_ms": statistics.median(tpots) if tpots else None,
+            "client_tpot_p95_ms": tpots[max(0, (len(tpots) * 95 + 99) // 100 - 1)] if tpots else None,
             "client_prompt_tokens_per_second": prompt_tokens / elapsed,
+            "client_output_tokens_per_second": output_tokens / elapsed,
             "prefill_only_workload": args.max_new_tokens == 1,
             "abort_requests_sent": len(abort_attempts), "abort_finish_reasons_observed": len(aborted),
             "abort_targets_not_observed": sorted(abort_rids.difference(aborted)),
@@ -272,7 +325,7 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def record_baseline(args: argparse.Namespace) -> dict[str, Any]:
-    """A6：保存同步 SSD 服务的 greedy 真实输出 token IDs，供服务重启后对照。"""
+    """A6：按 args 运行基线服务的固定负载，返回 greedy 输出 token ID 和结束原因供对照。"""
     report = _run(args=args)
     report["acceptance_passed"] = not report["summary"]["failed_request_ids"]
     return report
@@ -327,16 +380,15 @@ def run_stress(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
-def measure_prefill(args: argparse.Namespace) -> dict[str, Any]:
-    """A8：一 token 输出负载报告端到端 prefill 服务吞吐、TTFT及独立服务日志。"""
-    if args.max_new_tokens != 1:
-        raise ValueError("perf requires --max-new-tokens 1")
+def measure_perf(args: argparse.Namespace) -> dict[str, Any]:
+    """A8：按 args 的并发和固定输出长度运行性能负载，返回时延、吞吐及日志报告。"""
     report = _run(args=args)
     report["acceptance_passed"] = not report["summary"]["failed_request_ids"]
     return report
 
 
 def main() -> int:
+    """从命令行读取验收参数，写报告并返回该轮验收的退出码。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("record", "compare", "perf", "stress"))
     parser.add_argument("--url", default="http://127.0.0.1:30000")
@@ -360,7 +412,7 @@ def main() -> int:
         parser.error("compare requires --baseline")
     if args.output.exists():
         parser.error(f"Output already exists: {args.output}")
-    functions = {"record": record_baseline, "compare": compare_outputs, "perf": measure_prefill, "stress": run_stress}
+    functions = {"record": record_baseline, "compare": compare_outputs, "perf": measure_perf, "stress": run_stress}
     report = functions[args.command](args=args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x", encoding="utf-8") as stream:

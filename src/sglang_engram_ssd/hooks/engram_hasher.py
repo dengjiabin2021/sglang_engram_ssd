@@ -1,4 +1,4 @@
-"""在官方 Hasher 构造后捕获 CPU 参数，不提前调用 forward 或提交 history。"""
+"""捕获官方 CPU hash 参数和 decode forward 产出的 GPU 行号。"""
 
 from __future__ import annotations
 
@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING, Any
 
 from sglang.srt.plugins.hook_registry import HookType, plugin_hook as register_hook
 
-from ._registry import _HASH_INIT
+from ._registry import _HASH_FORWARD, _HASH_INIT
 
 if TYPE_CHECKING:
+    import torch
     from sglang.srt.layers.engram import EngramLayout
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 # sglang/python/sglang/srt/layers/engram.py：EngramHasher.__init__(
@@ -36,3 +38,20 @@ def capture_request_hasher(
     runtime = get_engram_ssd_runtime(dim=layout.head_dim)
     # 使用模型真实参数和 layout 的层顺序，避免根据 checkpoint 配置重算另一套 hash 参数。
     runtime.set_request_hasher(hasher=RequestHasher.from_hasher(hasher=self, layer_ids=layout.layer_ids))
+    self._engram_ssd = runtime
+
+
+# sglang/python/sglang/srt/layers/engram.py：EngramHasher.forward(
+#     self, input_ids: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor
+@register_hook(_HASH_FORWARD, type=HookType.AFTER)
+def capture_batch_hash(
+    result: torch.Tensor, self: Any, input_ids: torch.Tensor, forward_batch: ForwardBatch,
+) -> None:
+    """在原生 hash 和 history 更新提交后绑定本批，交出 decode 的 GPU 行号。
+
+    输入：result 为 GPU int64 [T,L,C]，各层行号可重复；self、input_ids、forward_batch 为原函数参数。
+    输出：无返回值；已登记的 decode 排队拷贝行号，prefill 仅关联批次，原生输出仍由模型使用。
+    """
+    runtime = getattr(self, "_engram_ssd", None)
+    if runtime is not None:
+        runtime.bind_batch(forward_batch=forward_batch, hash_ids=result)

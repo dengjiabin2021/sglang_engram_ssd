@@ -1,13 +1,79 @@
-// Python 绑定：接口声明在 batch_reader.h／prefetch_row_pool.h，实现位于各自同名 .cpp。
+// Python 绑定：转发行读取器、行池，并提供 decode 用的 CUDA 流标志操作。
 // 读取与行池重操作释放 GIL，返回或抛异常时恢复；参数转换与 Tensor 属性返回保留 GIL。
 #include <torch/extension.h>
 #include <pybind11/stl.h>
+#include <cuda.h>
+#include <cuda_runtime_api.h>
 
+#include <atomic>
 #include <memory>
 #include <vector>
 
 #include "batch_reader.h"
 #include "prefetch_row_pool.h"
+
+namespace sglang_engram_ssd::query {
+namespace {
+
+// 输入 CUDA driver 返回码和调用名。成功时返回，失败时附带 driver 错误名抛异常。
+void check_driver(CUresult result, const char* name) {
+  if (result != CUDA_SUCCESS) {
+    const char* error = nullptr;
+    cuGetErrorName(result, &error);
+    TORCH_CHECK(false, name, ": ", error, " (", static_cast<int>(result), ")");
+  }
+}
+
+// 输入 CPU pinned int32 [1] 零标志和 CUDA stream，返回标志的 GPU 映射地址；不支持时返回 0。
+// probe 为真时在空流上实测读写并收齐已提交操作；调用方持有 Tensor 的所有权。
+std::uintptr_t stream_flag_address(const at::Tensor& flags, std::uintptr_t stream, bool probe) {
+  void* mapped = nullptr;
+  const auto status = cudaHostGetDevicePointer(&mapped, flags.data_ptr<std::int32_t>(), 0);
+  if (status == cudaErrorNotSupported || status == cudaErrorInvalidValue) {
+    cudaGetLastError();
+    return 0;
+  }
+  TORCH_CHECK(status == cudaSuccess, "Engram cudaHostGetDevicePointer: ", cudaGetErrorString(status));
+  const auto address = reinterpret_cast<CUdeviceptr>(mapped);
+  if (!probe) {
+    return address;
+  }
+  const auto cuda_stream = reinterpret_cast<CUstream>(stream);
+  const auto write = cuStreamWriteValue32(cuda_stream, address, 0, CU_STREAM_WRITE_VALUE_DEFAULT);
+  if (write == CUDA_ERROR_NOT_SUPPORTED || write == CUDA_ERROR_INVALID_VALUE) {
+    return 0;
+  }
+  check_driver(write, "Engram cuStreamWriteValue32 probe");
+  const auto wait = cuStreamWaitValue32(cuda_stream, address, 0, CU_STREAM_WAIT_VALUE_GEQ);
+  check_driver(cuStreamSynchronize(cuda_stream), "Engram cuStreamSynchronize probe");
+  if (wait == CUDA_ERROR_NOT_SUPPORTED || wait == CUDA_ERROR_INVALID_VALUE) {
+    return 0;
+  }
+  check_driver(wait, "Engram cuStreamWaitValue32 probe");
+  return address;
+}
+
+// 输入 CUDA stream、对齐的 GPU 映射地址和目标值，入队等待 *address >= value，立即返回。
+// 调用方保持标志内存至流使用结束；CUDA 提交失败时抛异常。
+void wait_stream_flag(std::uintptr_t stream, std::uintptr_t address, std::uint32_t value) {
+  check_driver(cuStreamWaitValue32(reinterpret_cast<CUstream>(stream), address, value,
+                                 CU_STREAM_WAIT_VALUE_GEQ), "Engram cuStreamWaitValue32");
+}
+
+// 输入 CUDA stream 和 CPU pinned int32 [1] 的 GPU 映射地址，按流顺序重置标志，立即返回。
+// 必须在上一次 forward 使用该缓冲区结束后执行，最后由 hash D2H event 发布重置结果。
+void reset_stream_flag(std::uintptr_t stream, std::uintptr_t address) {
+  check_driver(cuStreamWriteValue32(reinterpret_cast<CUstream>(stream), address, 0, CU_STREAM_WRITE_VALUE_DEFAULT),
+               "Engram cuStreamWriteValue32");
+}
+
+// 输入 CPU pinned int32 [1]；暂存区写完后以 release 顺序放行 H2D，无返回值。
+void set_stream_flag(const at::Tensor& flags) {
+  std::atomic_ref<std::int32_t>(*flags.data_ptr<std::int32_t>()).store(1, std::memory_order_release);
+}
+
+}  // namespace
+}  // namespace sglang_engram_ssd::query
 
 namespace py = pybind11;
 using sglang_engram_ssd::query::BatchRowReader;
@@ -17,9 +83,17 @@ using sglang_engram_ssd::query::PrefetchRowPool;
 using sglang_engram_ssd::query::PrefetchRowPoolStats;
 using sglang_engram_ssd::query::PrefetchRowResolution;
 
-// 输入为 Python 导入系统提供的 module；副作用是登记 reader／行池及句柄接口，不创建运行资源。
+// 输入为 Python 导入系统提供的 module；登记读取、行池和 CUDA 流标志接口，不创建运行资源。
 PYBIND11_MODULE(_C, module) {
   module.doc() = "Engram SSD synchronous row reader and pinned prefetch pool";
+  using namespace sglang_engram_ssd::query;
+  module.def("stream_flag_address", &stream_flag_address, py::arg("flags"), py::arg("stream"), py::arg("probe"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def("wait_stream_flag", &wait_stream_flag, py::arg("stream"), py::arg("address"), py::arg("value"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def("reset_stream_flag", &reset_stream_flag, py::arg("stream"), py::arg("address"),
+             py::call_guard<py::gil_scoped_release>());
+  module.def("set_stream_flag", &set_stream_flag, py::arg("flags"));
 
   py::class_<BatchRowReader>(module, "BatchRowReader")
       .def(
@@ -76,7 +150,9 @@ PYBIND11_MODULE(_C, module) {
 
   py::class_<PrefetchRowHandle, std::shared_ptr<PrefetchRowHandle>>(module, "PrefetchRowHandle")
       .def_property_readonly("missing_row_ids", &PrefetchRowHandle::missing_row_ids)
-      .def_property_readonly("missing_slot_ids", &PrefetchRowHandle::missing_slot_ids);
+      .def_property_readonly("missing_slot_ids", &PrefetchRowHandle::missing_slot_ids)
+      .def_property_readonly("row_ids", &PrefetchRowHandle::row_ids)
+      .def_property_readonly("slot_ids", &PrefetchRowHandle::slot_ids);
 
   py::class_<PrefetchRowResolution>(module, "PrefetchRowResolution")
       .def_readonly("slot_ids", &PrefetchRowResolution::slot_ids)
@@ -101,6 +177,15 @@ PYBIND11_MODULE(_C, module) {
           "acquire", &PrefetchRowPool::acquire,
           py::kw_only(), py::arg("layer_id"), py::arg("row_ids"),
           py::call_guard<py::gil_scoped_release>())
+      .def("available_slots", &PrefetchRowPool::available_slots, py::call_guard<py::gil_scoped_release>())
+      .def(
+          "slots_needed", &PrefetchRowPool::slots_needed,
+          py::kw_only(), py::arg("layer_id"), py::arg("row_ids"), py::arg("limit") = -1,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "pending_slots", &PrefetchRowPool::pending_slots,
+          py::kw_only(), py::arg("layer_id"), py::arg("row_ids"),
+          py::call_guard<py::gil_scoped_release>())
       .def(
           "is_ready", &PrefetchRowPool::is_ready,
           py::kw_only(), py::arg("handle"),
@@ -115,7 +200,7 @@ PYBIND11_MODULE(_C, module) {
           py::call_guard<py::gil_scoped_release>())
       .def(
           "release", &PrefetchRowPool::release,
-          py::kw_only(), py::arg("handle"),
+          py::kw_only(), py::arg("handle"), py::arg("discard_pending") = false,
           py::call_guard<py::gil_scoped_release>())
       .def(
           "cancel", &PrefetchRowPool::cancel,
@@ -143,6 +228,8 @@ PYBIND11_MODULE(_C, module) {
         result["forward_misses"] = snapshot.forward_misses;
         result["miss_read_ms"] = snapshot.miss_read_ms;
         result["deferred_requests"] = snapshot.deferred_requests;
+        result["evicted_slots"] = snapshot.evicted_slots;
+        result["evicted_unused_slots"] = snapshot.evicted_unused_slots;
         result["tracking_enabled"] = snapshot.tracking_enabled;
         result["closed"] = snapshot.closed;
         return result;

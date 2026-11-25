@@ -16,6 +16,11 @@ def register() -> None:
     # 注册阶段只识别明确关闭值，不在这里解析预算和分块参数。
     # 非法配置留到模型加载 Hook 中报错，避免被 load_plugins 捕获后继续启动。
     if not should_register_hooks():
+        from .timing import timing_enabled
+
+        # SSD 关闭但开启计时：只给原生 Engram forward 套一层计时，不替换任何实现。
+        if timing_enabled():
+            from . import native_timing  # noqa: F401
         return
 
     # 装饰器在模块首次导入时登记；load_plugins 随后统一 apply_hooks。

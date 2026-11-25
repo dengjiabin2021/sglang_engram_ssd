@@ -1,4 +1,4 @@
-"""在真实 torchrun TP8 中核验同步查询与行池查询的逐位一致性。"""
+"""在真实 torchrun TP8 中核验显存批次查询与同步查询的逐位一致性。"""
 
 from __future__ import annotations
 
@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang_engram_ssd import sched_prefetch
 from sglang_engram_ssd.catalog import EngramSsdCatalog
 from sglang_engram_ssd.runtime import EngramSsdRuntime
-from sglang_engram_ssd.sched_prefetch import SchedulerPrefetchController, SchedulingFrame
 
 pytestmark = pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 8,
@@ -22,7 +22,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("warm", ["none", "partial", "all"])
-def test_real_tp8_pool_matches_sync(
+def test_real_tp8_batch_matches_sync(
     synthetic_catalog: Callable[..., tuple[EngramSsdCatalog, torch.Tensor, torch.Tensor]],
     cuda_native_device: torch.device,
     monkeypatch: pytest.MonkeyPatch,
@@ -31,6 +31,7 @@ def test_real_tp8_pool_matches_sync(
     """A0/A4：真实八 rank NCCL 合并，覆盖全未命中、部分命中及全命中。"""
     import torch.distributed as dist
     import sglang.srt.distributed as sglang_dist
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
     owned_group = not dist.is_initialized()
     if owned_group:
@@ -38,6 +39,7 @@ def test_real_tp8_pool_matches_sync(
     rank, world = dist.get_rank(), dist.get_world_size()
 
     def reduce_tensor(value: torch.Tensor) -> torch.Tensor:
+        """对 GPU BF16 局部值执行真实 NCCL 合并并返回结果。"""
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         return value
 
@@ -46,13 +48,26 @@ def test_real_tp8_pool_matches_sync(
     runtime = EngramSsdRuntime(
         catalog=catalog, dim=256, tp_rank=rank, tp_size=world,
         chunk_rows=3, io_uring_queue_depth=4, device=cuda_native_device,
-        sched_prefetch_enabled=True, pool_bytes=264 * 32,
+        sched_prefetch_enabled=True, pool_bytes=264 * 32, batch_tokens=8,
     )
     pool = runtime.pool
     assert pool is not None and runtime.reader is not None
     handle = None
     try:
-        ids = torch.tensor([[0, 5, 5, 22], [7, 12, 13, 0]], dtype=torch.int64, device=cuda_native_device)
+        cpu_ids = torch.tensor([[0, 5, 5, 22], [7, 12, 13, 0]], dtype=torch.int64)
+        ids = cpu_ids.to(device=cuda_native_device)
+        config = SimpleNamespace(window_batches=2, chunk_rows=3, log_interval=0)
+        monkeypatch.setattr(sched_prefetch, "get_config", lambda: config)
+
+        def predict(*, token_ids: list[int], start: int, end: int) -> torch.Tensor:
+            """按测试的 token 下标返回 CPU int64 [T,1,4] hash。"""
+            return cpu_ids[token_ids[start:end], None]
+
+        runtime.set_request_hasher(hasher=SimpleNamespace(
+            layer_ids=(1,), state=SimpleNamespace(offsets=cpu_ids[:1]), compute_request_row_ids=predict,
+        ))
+        scheduler = SimpleNamespace(chunked_prefill_size=8, tp_group=SimpleNamespace(cpu_group=None))
+        manager = runtime.get_sched_prefetch(scheduler=scheduler)
         lo, hi = 23 * rank // world, 23 * (rank + 1) // world
         rows = torch.arange(lo, hi, dtype=torch.int64)
         if warm == "none":
@@ -67,28 +82,35 @@ def test_real_tp8_pool_matches_sync(
         )
         pool.mark_ready(slot_ids=handle.missing_slot_ids)
         synchronous = runtime.reduce_output(out=runtime.lookup(layer_id=1, indices=ids))
-        pooled = runtime.reduce_output(out=runtime.lookup_from_pool(layer_id=1, indices=ids))
-        expected = weights.index_select(0, ids.cpu().reshape(-1)).view(torch.float8_e4m3fn)
+        req = SimpleNamespace(origin_input_ids=[0, 1], output_ids=[], full_untruncated_fill_ids=[0, 1])
+        scheduled = SimpleNamespace(
+            reqs=[req], prefix_lens=[0], extend_lens=[2], extend_num_tokens=2,
+            forward_mode=ForwardMode.EXTEND, input_ids=ids, forward_iter=1,
+        )
+        forward = SimpleNamespace(forward_mode=ForwardMode.EXTEND, input_ids=ids)
+        manager.register_request(req=req)
+        manager.start_batch(batch=scheduled, iteration=1)
+        runtime.bind_batch(forward_batch=forward, hash_ids=ids[:, None])
+        gathered = runtime.reduce_output(out=runtime.lookup_batch(layer_id=1, indices=ids, forward_batch=forward))
+        runtime.end_batch(batch=scheduled)
+        expected = weights.index_select(0, cpu_ids.reshape(-1)).view(torch.float8_e4m3fn)
         expected = expected.float().to(torch.bfloat16).view(2, 4, 256)
         assert torch.equal(synchronous.cpu(), expected)
-        assert torch.equal(pooled.cpu(), expected)
-        runtime.collect_pool_uses(wait=True)
+        assert torch.equal(gathered.cpu(), expected)
         pool.release(handle=handle)
         handle = None
         assert pool.stats()["referenced_slots"] == 0
         dist.barrier()
     finally:
-        runtime.collect_pool_uses(wait=True)
         if handle is not None:
-            pool.release(handle=handle)
+            pool.release(handle=handle, discard_pending=True)
         runtime.close()
         if owned_group:
             dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("flags", [(), (1, 0, 1)])
-def test_real_tp8_background_failure_uses_one_gloo_min(flags: tuple[int, ...]) -> None:
-    """A7/N1：真实八 rank CPU MIN 在有／无候选时均传播单 rank 后台错误。"""
+def test_real_tp8_background_failure_uses_one_gloo_min() -> None:
+    """完成标准 3：真实八 rank 对单个失败标志做 CPU MIN，统一报告一个 rank 的后台错误。"""
     import torch.distributed as dist
 
     # 固定较短通信超时，使漏发 collective 的错误实现明确失败，避免目标机无限等待。
@@ -101,16 +123,14 @@ def test_real_tp8_background_failure_uses_one_gloo_min(flags: tuple[int, ...]) -
     rank = dist.get_rank()
     try:
         # 这里只需要真实归约，不创建 reader、模型或后台线程；只有 TP3 持有本地错误。
-        controller = object.__new__(SchedulerPrefetchController)
+        controller = object.__new__(sched_prefetch.SchedulerPrefetchController)
         controller.runtime = SimpleNamespace(tp_size=dist.get_world_size())
         controller.cpu_group = cpu_group
         controller._condition = threading.Condition()
         cause = OSError("synthetic background failure on TP3") if rank == 3 else None
         controller._failure = cause
-        frame = SchedulingFrame(controller=controller, scheduler=SimpleNamespace(), original_queue=[])
         with pytest.raises(RuntimeError, match="failed on a TP rank") as error:
-            controller._synchronize_flags(flags=flags, frame=frame)
-        assert frame.synchronized
+            controller._synchronize_failure()
         assert error.value.__cause__ is cause
 
         # 每个 rank 都须走过相同异常边界；本测试不让健康 rank 提前进入下一模型通信。

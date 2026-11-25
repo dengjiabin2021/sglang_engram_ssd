@@ -101,7 +101,8 @@ def load_model_with_engram_ssd(
     hf_config = model_config.hf_config
     if config.sched_prefetch_enabled:
         row_bytes = hf_config.engram_head_dim + hf_config.engram_head_dim // 32
-        if config.pool_bytes < row_bytes:
+        # 只校验显式给出的字节数；按批次定容时在 runtime 拿到 hash 布局后再校验。
+        if config.pool_bytes is not None and config.pool_bytes < row_bytes:
             raise ValueError("Engram SSD SCHED_PREFETCH_POOL_BYTES must hold at least one row")
     layer_rows = dict(zip(
         hf_config.engram_layer_ids,

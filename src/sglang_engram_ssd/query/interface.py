@@ -31,7 +31,7 @@ class RowTableSpec:
 class PoolResolution:
     """承载一次 resolve 的查询位置与临时槽引用，不管理 GPU 执行。
 
-    forward 创建并持有结果，handle 保持槽稳定，须在 gather 的 CUDA event 完成后显式 release。
+    batch 组装方持有结果，handle 保持槽稳定，完成暂存区复制后显式 release。
     元数据张量由结果持有；调用方只读使用，不与其他线程修改同一结果。
     """
 
@@ -92,12 +92,12 @@ class BatchRowReader(Protocol):
         self, *, layer_id: int, row_ids: torch.Tensor, slot_ids: torch.Tensor,
         weight_base: torch.Tensor, scale_base: torch.Tensor,
     ) -> None:
-        """按指定槽号同步写入缺失行，供行池消费。
+        """按指定槽号同步写入行池或调用方的 batch 暂存区。
 
         输入：layer_id 为已登记层；row_ids 为连续 CPU int64 [Q] 全局行号，可重复且属于 [0,rows)。
             slot_ids 为等长连续 CPU int64 [Q]，槽号互不重复且属于 [0,S)。
             weight_base／scale_base 为连续 CPU uint8 [S,D]／[S,D/32]，目标槽已被调用方预留。
-        输出：只写指定槽，不发布池状态；成功返回后才可 mark_ready，失败先收齐 I/O 再抛错。
+        输出：只写指定槽；池槽在成功返回后由调用方 mark_ready，失败先收齐 I/O 再抛错。
         原生读取释放 GIL，行步长从 Tensor 读取；调用期间槽不能回收，也不能被 GPU 读取。
         """
         ...

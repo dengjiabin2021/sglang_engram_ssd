@@ -34,9 +34,10 @@ __all__ = [
 
 if should_register_sched_prefetch_hooks():
     # 开关关闭不导入新 Hook，避免仅导入插件就捕获 hash 参数或创建调度资源。
-    from .engram_hasher import capture_request_hasher
+    from .engram_hasher import capture_batch_hash, capture_request_hasher
     from .scheduler import (
-        filter_engram_candidates,
+        prepare_engram_batch,
+        reconcile_engram_window,
         record_engram_batch,
         register_waiting_request,
         release_engram_prefill,
@@ -44,6 +45,6 @@ if should_register_sched_prefetch_hooks():
     )
 
     __all__.extend([
-        "capture_request_hasher", "register_waiting_request", "schedule_engram_prefill",
-        "filter_engram_candidates", "record_engram_batch", "release_engram_prefill",
+        "capture_request_hasher", "capture_batch_hash", "register_waiting_request", "schedule_engram_prefill",
+        "reconcile_engram_window", "prepare_engram_batch", "record_engram_batch", "release_engram_prefill",
     ])
